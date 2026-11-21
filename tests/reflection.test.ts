@@ -15,6 +15,7 @@ import {
     mergeEpisodes,
     trimProfileByTier,
     parseReflectionJSON,
+    runReflection,
     DEFAULT_TIER_LIMITS,
     isSizeReducibleError,
     REFLECTION_SCOPE_LEVELS,
@@ -541,6 +542,167 @@ describe("REFLECTION_SCOPE_LEVELS 收缩梯度", () => {
     it("所有上限均为正数（收缩到 minimal 仍喂得动数据）", () => {
         for (const s of REFLECTION_SCOPE_LEVELS) {
             assert.ok(s.maxTopicBlocks > 0 && s.maxMessagesPerTopic > 0 && s.maxInteractions > 0, s.label);
+        }
+    });
+});
+
+describe("Reflection isolation & concurrency remediation", () => {
+    it("isolates Discord per-channel lastReflectedAt from guild row and sibling channel", async () => {
+        const mem = createTestMemory("refl-discord-channels");
+        const guildId = "discord:g500";
+        const chan1 = "discord:g500:c1";
+        const chan2 = "discord:g500:c2";
+        const llmCfg = [{ provider: "openai" as const, baseUrl: "https://example.invalid/v1", apiKey: "k", model: "m" }];
+        const origFetch = globalThis.fetch;
+        try {
+            mem.upsertGroupModel(guildId, {
+                chatTitle: "Guild 500",
+                description: "Guild shared culture",
+                lastReflectedAt: "2099-01-01T00:00:00.000Z",
+                recentFeedback: "Guild stale feedback",
+            });
+            mem.upsertTopic("t_c1", {
+                chatId: chan1,
+                label: "Chan1 topic",
+                summary: "c1",
+                participants: ["discord:u1"],
+                startedAt: "2026-05-01T10:00:00.000Z",
+            });
+            mem.upsertTopic("t_c2", {
+                chatId: chan2,
+                label: "Chan2 topic",
+                summary: "c2",
+                participants: ["discord:u2"],
+                startedAt: "2026-05-01T11:00:00.000Z",
+            });
+
+            const prompts: string[] = [];
+            globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+                const body = JSON.parse(String(init?.body ?? "{}"));
+                prompts.push(body.messages?.[1]?.content ?? "");
+                return new Response(JSON.stringify({
+                    choices: [{ message: { content: JSON.stringify({ personUpdates: [], groupUpdates: {}, factUpdates: [], topicsSummary: [], insights: "ok" }) } }],
+                }), { status: 200, headers: { "Content-Type": "application/json" } });
+            }) as typeof fetch;
+
+            await runReflection(chan1, mem, llmCfg);
+            assert.equal(prompts.length, 1);
+            assert.ok(prompts[0].includes("Chan1 topic"));
+            assert.ok(mem.getGroupModel(chan1)?.lastReflectedAt);
+            assert.equal(mem.getGroupModel(chan2), null);
+
+            await runReflection(chan2, mem, llmCfg);
+            assert.equal(prompts.length, 2);
+            assert.ok(prompts[1].includes("Chan2 topic"));
+            assert.ok(!mem.getGroupModel(chan2)?.recentFeedback.includes("Guild stale feedback"));
+        } finally {
+            globalThis.fetch = origFetch;
+            cleanupTestMemory(mem, "refl-discord-channels");
+        }
+    });
+
+    it("preserves concurrent offline_history and new live episodes during async mergeEpisodes", async () => {
+        const mem = createTestMemory("refl-merge-race");
+        const chatId = "onebot:group:777";
+        const userId = "onebot:u1";
+        const llmCfg = [{ provider: "openai" as const, baseUrl: "https://example.invalid/v1", apiKey: "k", model: "m" }];
+        const origFetch = globalThis.fetch;
+        try {
+            mem.upsertPersonGroupProfile(userId, chatId, {
+                dunbarTier: 2,
+                recentEpisodes: [
+                    mockEpisode({ id: "old_live_1", date: daysAgo(10), summary: "Old live 1" }),
+                ],
+                mergedMemory: [],
+            });
+
+            let releaseFetch!: () => void;
+            const fetchStarted = new Promise<void>(resolve => {
+                globalThis.fetch = (async () => {
+                    resolve();
+                    await new Promise<void>(r => { releaseFetch = r; });
+                    return new Response(JSON.stringify({
+                        choices: [{ message: { content: JSON.stringify({ overallSentiment: "positive", highlights: ["Old live 1"], relationshipTrend: "steady" }) } }],
+                    }), { status: 200, headers: { "Content-Type": "application/json" } });
+                }) as typeof fetch;
+            });
+
+            const mergePromise = mergeEpisodes(userId, chatId, mem, llmCfg);
+            await fetchStarted;
+
+            // Simulate concurrent offline_history seed + concurrent new live episode arriving while LLM merge is in flight
+            const cur = mem.getProfilesForChat(chatId).find(p => p.userId === userId)!;
+            mem.upsertPersonGroupProfile(userId, chatId, {
+                recentEpisodes: [
+                    ...cur.recentEpisodes,
+                    mockEpisode({ id: "concurrent_offline_1", date: daysAgo(30), summary: "Concurrent offline", origin: "offline_history" }),
+                    mockEpisode({ id: "concurrent_live_2", date: daysAgo(0), summary: "Concurrent live 2", origin: "live" }),
+                ],
+            });
+
+            releaseFetch();
+            const mergedCount = await mergePromise;
+            assert.equal(mergedCount, 1);
+
+            const after = mem.getProfilesForChat(chatId).find(p => p.userId === userId)!;
+            const ids = after.recentEpisodes.map(e => e.id).sort();
+            assert.deepEqual(ids, ["concurrent_live_2", "concurrent_offline_1"]);
+            assert.equal(after.mergedMemory.length, 1);
+        } finally {
+            globalThis.fetch = origFetch;
+            cleanupTestMemory(mem, "refl-merge-race");
+        }
+    });
+
+    it("excludes offline_history episodes from prompt and skips globalPersonUpdates without live evidence", async () => {
+        const mem = createTestMemory("refl-no-offline-global");
+        const chatId = "onebot:group:778";
+        const llmCfg = [{ provider: "openai" as const, baseUrl: "https://example.invalid/v1", apiKey: "k", model: "m" }];
+        const origFetch = globalThis.fetch;
+        try {
+            mem.upsertPersonGroupProfile("onebot:offline_only", chatId, {
+                recentEpisodes: [
+                    mockEpisode({ id: "ep_off", summary: "离线历史摘要_SECRET_OFFLINE", origin: "offline_history" }),
+                ],
+            });
+            mem.upsertTopic("live_t1", {
+                chatId,
+                label: "Live chat",
+                summary: "Active user spoke",
+                participants: ["onebot:live_user"],
+                startedAt: "2026-05-01T10:00:00.000Z",
+            });
+
+            let capturedPrompt = "";
+            globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+                const body = JSON.parse(String(init?.body ?? "{}"));
+                capturedPrompt = body.messages?.[1]?.content ?? "";
+                return new Response(JSON.stringify({
+                    choices: [{
+                        message: {
+                            content: JSON.stringify({
+                                globalPersonUpdates: [
+                                    { userId: "onebot:offline_only", traits: ["should_not_promote"] },
+                                    { userId: "onebot:live_user", traits: ["promoted_live"] },
+                                ],
+                                personUpdates: [],
+                                groupUpdates: {},
+                                factUpdates: [],
+                                topicsSummary: [],
+                                insights: "ok",
+                            }),
+                        },
+                    }],
+                }), { status: 200, headers: { "Content-Type": "application/json" } });
+            }) as typeof fetch;
+
+            await runReflection(chatId, mem, llmCfg);
+            assert.ok(!capturedPrompt.includes("离线历史摘要_SECRET_OFFLINE"));
+            assert.equal(mem.getPersonProfile("onebot:offline_only"), null);
+            assert.deepEqual(mem.getPersonProfile("onebot:live_user")?.traits, ["promoted_live"]);
+        } finally {
+            globalThis.fetch = origFetch;
+            cleanupTestMemory(mem, "refl-no-offline-global");
         }
     });
 });

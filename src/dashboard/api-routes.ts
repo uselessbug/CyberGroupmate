@@ -584,7 +584,7 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
     // ─── Messages ───
     router.get("/messages/:chatId", (req, res) => {
         const limit = Math.min(parseInt(qs(req.query.limit)) || 50, 200);
-        const messages = deps.memory.getRecentMessages(req.params.chatId, limit);
+        const messages = deps.memory.getRecentMessages(req.params.chatId, limit, { includeBlocked: true });
         res.json(messages);
     });
 
@@ -1148,7 +1148,7 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
             if (chatId) {
                 profiles = deps.memory.getProfilesForChat(chatId).filter((p: any) => p.userId === userId);
             }
-            const facts = await deps.memory.recall(userId, { maxResults: 20 });
+            const facts = await deps.memory.recall(userId, { maxResults: 20, includeAllHistory: true });
             res.json({ identity, profiles, facts });
         } catch (err) {
             res.status(500).json({ error: String(err) });
@@ -1177,6 +1177,7 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
                 daysBack: daysBack ? Number(daysBack) : undefined,
                 categories: Array.isArray(categories) ? categories : undefined,
                 maxResults: maxResults ? Math.min(Number(maxResults), 50) : 20,
+                includeAllHistory: true,
             });
             res.json(result);
         } catch (err) {
@@ -1723,7 +1724,7 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
         const offset = Math.max(parseInt(qs(req.query.offset)) || 0, 0);
         const subject = qs(req.query.subject) || undefined;
         const category = qs(req.query.category) || undefined;
-        res.json(deps.memory.listCoreFacts({ subject, category, limit, offset }));
+        res.json(deps.memory.listCoreFacts({ subject, category, limit, offset, includeAllHistory: true }));
     });
 
     router.put("/memory/fact/:id", (req, res) => {

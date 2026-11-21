@@ -13,6 +13,14 @@ type MemoryPersonMatchType =
     | "fact_subject"
     | "topic_participant";
 
+type ChatNameKind =
+    | "sender_display"
+    | "sender_card"
+    | "sender_nickname"
+    | "sender_name"
+    | "mention_display"
+    | "self_claim";
+
 interface MemoryPersonMatch {
     identity: {
         userId: string;
@@ -58,6 +66,12 @@ interface MemoryPersonMatch {
     matchType: MemoryPersonMatchType;
     score: number;
     reasons: string[];
+    /** 当前绑定会话内命中的局部名称证据（群名片 / 发送名 / @ 提及名等）。 */
+    chatName?: {
+        chatId: string;
+        displayName: string;
+        kind: ChatNameKind;
+    };
 }
 
 interface MemoryModule {
@@ -186,6 +200,10 @@ interface MemoryModule {
         significance: number;
     }>>;
 
+    /**
+     * 按人名、别名、本会话局部群名片/@ 提及名、username 或 userId 解析候选身份。
+     * sandbox 内自动锁定为当前绑定会话，无法越权检索其他会话的局部名称。
+     */
     resolvePerson(query: string, options?: {
         chatId?: string;
         limit?: number;
@@ -193,6 +211,9 @@ interface MemoryModule {
         matches: MemoryPersonMatch[];
     }>;
 
+    /**
+     * 获取某人的综合档案；sandbox 内自动锁定到当前绑定会话的局部名称与消息/话题/互动/群画像。
+     */
     getPersonDossier(queryOrUserId: string, options?: {
         chatId?: string;
         /** 默认 3，最大 10。 */

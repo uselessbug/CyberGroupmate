@@ -66,6 +66,14 @@ interface MemoryTimelineOptions {
     includeDigests?: boolean;
 }
 
+type ChatNameKind =
+    | "sender_display"
+    | "sender_card"
+    | "sender_nickname"
+    | "sender_name"
+    | "mention_display"
+    | "self_claim";
+
 interface MemoryIdentityMatch {
     identity: {
         userId: string;
@@ -85,6 +93,12 @@ interface MemoryIdentityMatch {
     /** 相关性分数，越高越相关。 */
     score: number;
     reasons: string[];
+    /** 提供 chatId 时，命中的该会话局部群名片 / 显示名 / @ 提及名证据。 */
+    chatName?: {
+        chatId: string;
+        displayName: string;
+        kind: ChatNameKind;
+    };
 }
 
 interface MemorySearchEntitiesResult {
@@ -174,14 +188,14 @@ interface MemoryGetPersonDossierResult {
 
 declare const memory: {
     /**
-     * 把人名、别名、username 或 userId 解析成候选身份，并按相关性排序。
-     * 优先级大致为 exact userId / exact alias > partial alias > fact subject > topic participant。
+     * 把人名、别名、群内名称（含被 @ 提及名，需传 chatId）、username 或 userId 解析成候选身份，并按相关性排序。
+     * 优先级大致为 exact userId > chatId 局部精确匹配 > 全局精确别名 > 前缀/子串匹配。
      */
     resolvePerson(query: string, options?: MemorySearchEntitiesOptions): Promise<MemoryResolvePersonResult>;
 
     /**
      * 面向“评价某人 / 了解某人”的一站式人物资料包。
-     * 先解析身份，再聚合跨群画像、核心事实、近期互动、近期话题和消息样本。
+     * 先解析身份，再聚合画像、核心事实、近期互动、近期话题和消息样本；传入 chatId 时局部名称与消息/话题/互动/群画像按该会话收窄。
      */
     getPersonDossier(queryOrUserId: string, options?: MemoryGetPersonDossierOptions): Promise<MemoryGetPersonDossierResult>;
 

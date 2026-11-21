@@ -872,21 +872,27 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
             const [query, options] = args as [string, { subject?: string; categories?: string[]; limit?: number } | undefined];
             // R1：丢弃 visibility=private 且来源 ≠ 当前会话的 fact（跨私聊/敏感群泄露兜底）。
             const facts = memory.searchFacts(query, {
-                ...options,
-                categories: options?.categories as any,
+                subject: typeof options?.subject === "string" ? options.subject : undefined,
+                categories: Array.isArray(options?.categories) ? options.categories as any : undefined,
+                limit: typeof options?.limit === "number" ? options.limit : undefined,
+                authorizedChatId: chatId,
+                includeAllHistory: false,
             });
             return scrubFactsByVisibility(facts, policy(), method).kept;
         }
         if (method === "memory.searchTopics") {
             const [query, options] = args as [string, { chatId?: string; after?: string | number | Date; before?: string | number | Date; limit?: number } | undefined];
             const ctx = policy();
+            const requestedChatId = typeof options?.chatId === "string" && options.chatId.trim() ? options.chatId.trim() : undefined;
             // R1（显式 target）：显式请求其它私密会话的话题 → 直接拦截返回空。
-            if (options?.chatId && isExplicitReadBlocked(options.chatId, ctx)) return [];
+            if (requestedChatId && isExplicitReadBlocked(requestedChatId, ctx)) return [];
             const rows = memory.searchTopics(query, {
-                ...options,
                 after: timestampInputToIso(options?.after) ?? undefined,
                 before: timestampInputToIso(options?.before) ?? undefined,
-                chatId: options?.chatId ?? chatId,
+                limit: typeof options?.limit === "number" ? options.limit : undefined,
+                chatId: requestedChatId ?? chatId,
+                authorizedChatId: chatId,
+                includeAllHistory: false,
             });
             const visibleRows = scrubRowsByVisibility(rows, (r) => r.chatId, ctx, method).kept;
             return scrubAssociatedMemoriesByVisibility(visibleRows, ctx, method).kept;
@@ -894,13 +900,15 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
         if (method === "memory.searchMessages") {
             const [query, options] = args as [string, { chatId?: string; userId?: string; after?: string | number | Date; before?: string | number | Date; limit?: number } | undefined];
             const ctx = policy();
+            const requestedChatId = typeof options?.chatId === "string" && options.chatId.trim() ? options.chatId.trim() : undefined;
             // R1（显式 target）：显式请求其它私密会话的消息记录 → 直接拦截返回空。
-            if (options?.chatId && isExplicitReadBlocked(options.chatId, ctx)) return [];
+            if (requestedChatId && isExplicitReadBlocked(requestedChatId, ctx)) return [];
             const rows = memory.searchMessages(query, {
-                ...options,
+                userId: typeof options?.userId === "string" ? options.userId : undefined,
                 after: timestampInputToIso(options?.after) ?? undefined,
                 before: timestampInputToIso(options?.before) ?? undefined,
-                chatId: options?.chatId ?? chatId,
+                limit: typeof options?.limit === "number" ? options.limit : undefined,
+                chatId: requestedChatId ?? chatId,
             });
             return scrubRowsByVisibility(rows, (r) => r.chatId, ctx, method).kept;
         }
@@ -918,7 +926,10 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                     log.info("getUserProfile alias resolved", { from: userId, to: resolvedUserId } as any);
                 }
             }
-            const profile = memory.getUserProfile(resolvedUserId, effective) as unknown as Record<string, unknown> | null;
+            const profile = memory.getUserProfile(resolvedUserId, effective, {
+                authorizedChatId: chatId,
+                includeAllHistory: false,
+            }) as unknown as Record<string, unknown> | null;
             if (profile && Array.isArray((profile as { recentFacts?: unknown[] }).recentFacts)) {
                 (profile as { recentFacts: unknown[] }).recentFacts =
                     scrubFactsByVisibility((profile as { recentFacts: any[] }).recentFacts, ctx, method).kept;
@@ -948,8 +959,11 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
         }
         if (method === "memory.resolvePerson") {
             const [query, options] = args as [string, { chatId?: string; limit?: number } | undefined];
-            const api = createMemoryApi(memory);
-            const result = await api.resolvePerson(query, { ...options, chatId: options?.chatId ?? chatId });
+            const api = createMemoryApi(memory, { boundChatId: chatId });
+            const result = await api.resolvePerson(query, {
+                chatId: typeof options?.chatId === "string" ? options.chatId : undefined,
+                limit: typeof options?.limit === "number" ? options.limit : undefined,
+            });
             scrubIdentityMatches(result.matches, policy()); // matches[].profile.recentFacts 泄露点
             return result;
         }
@@ -963,8 +977,16 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                 messagesLimit?: number;
                 groupProfilesLimit?: number;
             } | undefined];
-            const api = createMemoryApi(memory);
-            const result = await api.getPersonDossier(queryOrUserId, { ...options, chatId: options?.chatId ?? chatId });
+            const api = createMemoryApi(memory, { boundChatId: chatId });
+            const result = await api.getPersonDossier(queryOrUserId, {
+                chatId: typeof options?.chatId === "string" ? options.chatId : undefined,
+                limit: typeof options?.limit === "number" ? options.limit : undefined,
+                factsLimit: typeof options?.factsLimit === "number" ? options.factsLimit : undefined,
+                interactionsLimit: typeof options?.interactionsLimit === "number" ? options.interactionsLimit : undefined,
+                topicsLimit: typeof options?.topicsLimit === "number" ? options.topicsLimit : undefined,
+                messagesLimit: typeof options?.messagesLimit === "number" ? options.messagesLimit : undefined,
+                groupProfilesLimit: typeof options?.groupProfilesLimit === "number" ? options.groupProfilesLimit : undefined,
+            });
             // R1（聚合）：人物档案跨所有会话聚合，逐项丢弃来源私密且 ≠ 当前会话的数据。
             scrubDossiers(result.dossiers, policy());
             return result;
@@ -979,14 +1001,16 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                 limit?: number;
             } | undefined];
             const ctx = policy();
-            if (options?.chatId && isExplicitReadBlocked(options.chatId, ctx)) return { sessionDigests: [] };
-            const api = createMemoryApi(memory);
+            const requestedChatId = typeof options?.chatId === "string" && options.chatId.trim() ? options.chatId.trim() : undefined;
+            if (requestedChatId && isExplicitReadBlocked(requestedChatId, ctx)) return { sessionDigests: [] };
+            const api = createMemoryApi(memory, { boundChatId: chatId });
             const result = await api.searchAgentMemory(query, {
-                ...options,
-                chatId: options?.chatId ?? chatId,
+                chatId: requestedChatId ?? chatId,
+                actorType: typeof options?.actorType === "string" ? options.actorType : undefined,
                 after: timestampInputToIso(options?.after) ?? undefined,
                 before: timestampInputToIso(options?.before) ?? undefined,
-                kind: options?.kind as any,
+                kind: typeof options?.kind === "string" ? options.kind as any : undefined,
+                limit: typeof options?.limit === "number" ? options.limit : undefined,
             });
             result.sessionDigests = scrubRowsByVisibility(result.sessionDigests, (r) => r.sourceChatId ?? r.targetChatId, ctx, method).kept;
             return result;
@@ -1001,16 +1025,23 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                 includeDigests?: boolean;
             } | undefined];
             const ctx = policy();
-            if (options?.chatId && isExplicitReadBlocked(options.chatId, ctx)) return { entries: [] };
-            const api = createMemoryApi(memory);
-            const result = await api.getTimeline({
-                ...options,
-                chatId: options?.chatId ?? chatId,
+            const requestedChatId = typeof options?.chatId === "string" && options.chatId.trim() ? options.chatId.trim() : undefined;
+            if (requestedChatId && isExplicitReadBlocked(requestedChatId, ctx)) return { entries: [] };
+            const rawLimit = typeof options?.limit === "number" && Number.isFinite(options.limit) ? Math.floor(options.limit) : 30;
+            const limit = Math.min(Math.max(rawLimit, 1), 100);
+            const entries = memory.getTimeline({
+                chatId: requestedChatId ?? chatId,
                 after: timestampInputToIso(options?.after) ?? undefined,
                 before: timestampInputToIso(options?.before) ?? undefined,
+                limit,
+                includeTopics: typeof options?.includeTopics === "boolean" ? options.includeTopics : undefined,
+                includeDigests: typeof options?.includeDigests === "boolean" ? options.includeDigests : undefined,
+                authorizedChatId: chatId,
+                includeAllHistory: false,
             });
-            result.entries = scrubRowsByVisibility(result.entries, (r) => r.chatId, ctx, method).kept;
-            return result;
+            return {
+                entries: scrubRowsByVisibility(entries, (r) => r.chatId, ctx, method).kept,
+            };
         }
         if (method === "memory.semanticSearch") {
             const [rawQuery, options] = args as [string, { scope?: "facts" | "topics" | "all"; limit?: number } | undefined];
@@ -1027,10 +1058,10 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                     const ctx = policy();
                     const rawFacts = options?.scope === "topics"
                         ? []
-                        : scrubFactsByVisibility(memory.vectorSearchFacts(queryEmbedding, limit), ctx, method).kept;
+                        : scrubFactsByVisibility(memory.vectorSearchFacts(queryEmbedding, limit, undefined, { authorizedChatId: chatId, includeAllHistory: false }), ctx, method).kept;
                     const rawTopics = options?.scope === "facts"
                         ? []
-                        : scrubRowsByVisibility(memory.vectorSearchTopics(queryEmbedding, limit, topicChatId), (t) => t.chatId, ctx, method).kept;
+                        : scrubRowsByVisibility(memory.vectorSearchTopics(queryEmbedding, limit, topicChatId, { authorizedChatId: chatId, includeAllHistory: false }), (t) => t.chatId, ctx, method).kept;
                     const factResults = rawFacts.map((fact) => ({
                         type: "fact" as const,
                         content: `[${fact.subject} · ${fact.category}] ${fact.content}`,
@@ -1050,7 +1081,12 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                 }
             }
 
-            const recallResult = await memory.recall(query, { chatId, maxResults: limit });
+            const recallResult = await memory.recall(query, {
+                chatId,
+                authorizedChatId: chatId,
+                includeAllHistory: false,
+                maxResults: limit,
+            });
             // recall() 不做可见性兜底（其结果现携带 sourceChatId/visibility）；与上面的向量快路径一致，
             // 在 chokepoint 这里统一 scrub 掉来源私密且 ≠ 当前会话的 fact / topic。
             const ctx = policy();

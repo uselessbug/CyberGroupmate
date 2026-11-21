@@ -87,8 +87,8 @@ modules/memory.d.ts — 记忆检索模块类型定义
 - `searchMessages`: searchMessages(query, options?)
 - `getUserProfile`: getUserProfile(userId, chatId?)
 - `getRecentInteractions`: getRecentInteractions(chatId?, userId?, limit?)
-- `resolvePerson`: resolvePerson(query, options?)
-- `getPersonDossier`: getPersonDossier(queryOrUserId, options?)
+- `resolvePerson`: 按人名、别名、本会话局部群名片/@ 提及名、username 或 userId 解析候选身份。 sandbox 内自动锁定为当前绑定会话，无法越权检索其他会话的局部名称。
+- `getPersonDossier`: 获取某人的综合档案；sandbox 内自动锁定到当前绑定会话的局部名称与消息/话题/互动/群画像。
 - `searchAgentMemory`: 搜索 agent 自己的长期意识/意图记忆：Meta 决策、subagent 回调、harness 做梦、派发结果等。
 - `getTimeline`: 获取近期时间线，合并 session digests 与话题摘要。
 - `semanticSearch`: 语义检索记忆（事实 + 话题）。 话题按当前会话收窄；核心事实（人物画像类）为全局知识，仍可能返回。

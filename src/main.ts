@@ -18,7 +18,7 @@ import { SandboxPool } from "./sandbox/sandbox-pool.js";
 import type { ShellWakeEvent } from "./sandbox/sandbox.js";
 import { installSkillsDependencies } from "./sandbox/skill-loader.js";
 import { createSandboxHostCallHandler } from "./sandbox/host-call-handler.js";
-import { MemoryStoreV2 } from "./memory-v2/index.js";
+import { MemoryStoreV2, computeStatsHour } from "./memory-v2/index.js";
 import { createMemoryStore } from "./core/memory-factory.js";
 import {
     loadConfig,
@@ -479,13 +479,16 @@ async function main(): Promise<void> {
     }
 
     if (appConfig.onebot) {
-        const onebotAdapter = new OneBotAdapter(appConfig.onebot, nc, sharedMediaDownloader, stickerSendPolicy);
+        const onebotAdapter = new OneBotAdapter(appConfig.onebot, nc, sharedMediaDownloader, stickerSendPolicy, {
+            shouldCacheSender: ({ chatId, userId }) =>
+                !shouldDropInbound(loadConfig().chatFilter, { chatId, userId }) && !userGate.shouldDrop(userId),
+        });
         adapters.push(onebotAdapter);
     }
 
     if (appConfig.feishu) {
         adapters.push(new FeishuAdapter(appConfig.feishu, nc, resolve(DATA_DIR), {
-            hasMessage: (chatId, messageId) => memory.getMessageById(chatId, messageId) !== null,
+            hasMessage: (chatId, messageId) => memory.getMessageById(chatId, messageId, { includeBlocked: true }) !== null,
         }));
     }
 
@@ -635,7 +638,7 @@ async function main(): Promise<void> {
         nc,
         adapters,
         getWatermark: (chatId, ordering) => memory.getBackfillWatermark(chatId, ordering),
-        listKnownChatIds: (platform) => memory.listKnownChatIds(platform),
+        listKnownChatIds: (platform) => memory.listBackfillChatIds(platform),
         onConsolidatedWake: (chatId, summary) => {
             const sub = subagentManager.getOrCreate(chatId);
             const entry = sub.buildQueueEntry("DIRECT_ADDRESS");
@@ -688,7 +691,7 @@ async function main(): Promise<void> {
             const text = String(event.text ?? "");
             const mediaFields = normalizeMessageMediaFields((event as any).mediaInfo, text);
             try {
-                memory.storeMessageBatch([{
+                memory.storeIngestedBatch([{
                     messageId,
                     chatId: compositeChatId,
                     userId: typeof event.senderUserId === "string" ? event.senderUserId : agentName,
@@ -699,6 +702,9 @@ async function main(): Promise<void> {
                     timestamp,
                     mediaType: mediaFields.mediaType,
                     mediaInfo: mediaFields.mediaInfo,
+                    origin: "live",
+                    countAsHuman: false,
+                    statsHour: null,
                 }]);
                 memory.storeInteraction({
                     chatId: compositeChatId,
@@ -771,20 +777,38 @@ async function main(): Promise<void> {
         // storeMessageBatch 内部使用 INSERT OR IGNORE，所以 RecordingPipeline
         // 后续 flush 时的重复写入不会冲突。
         try {
-            memory.storeMessageBatch([{
+            const msgTimestamp = resolveEventTimestamp(event);
+            const msgUserId = ensureCompositeId(getPlatform(chatId), String(event.userId ?? event.user_id ?? event.senderId ?? ""));
+            const msgDisplayName = String(event.displayName ?? event.senderName ?? event.userName ?? "");
+            const msgUsername = typeof event.username === "string" && event.username.trim() ? event.username.trim() : undefined;
+            const isOneBotGroup = chatId.startsWith("onebot:group:");
+            const agentName = appConfig.persona?.name ?? "agent";
+            const isAgentSelf = event.isAgent === true
+                || msgUserId === agentName
+                || (appConfig.onebot?.selfId ? msgUserId === ensureCompositeId("onebot", String(appConfig.onebot.selfId)) : false);
+            const countAsHuman = !accessControlBlocked && !isAgentSelf;
+            memory.storeIngestedBatch([{
                 messageId: String(event.messageId ?? event.id ?? `msg_${Date.now()}`),
                 chatId,
-                userId: ensureCompositeId(getPlatform(chatId), String(event.userId ?? event.user_id ?? event.senderId ?? "")),
-                displayName: String(event.displayName ?? event.senderName ?? event.userName ?? ""),
+                userId: msgUserId,
+                displayName: msgDisplayName,
+                ...(event.displayNameSource === "chat" || event.displayNameSource === "account_fallback" || event.displayNameSource === "qce"
+                    ? { displayNameSource: event.displayNameSource }
+                    : {}),
                 text: String(event.text ?? event.message ?? ""),
                 mentions: readMessageMentions(event.mentions),
                 replyToMessageId: event.replyToMessageId ? String(event.replyToMessageId) : undefined,
                 // 必须用消息原始时间：backfill 补抓的历史消息若打上"现在"，
                 // message_log 的时序（以及基于它的 LLM 上下文）会整体错乱。
-                timestamp: resolveEventTimestamp(event),
+                timestamp: msgTimestamp,
                 mediaType: (event as any).mediaInfo?.type ?? undefined,
                 mediaInfo: (event as any).mediaInfo ? JSON.stringify((event as any).mediaInfo) : undefined,
                 accessControlBlocked,
+                origin: "live",
+                countAsHuman,
+                statsHour: countAsHuman ? computeStatsHour(msgTimestamp) : null,
+                globalDisplayName: isOneBotGroup ? undefined : (msgDisplayName || undefined),
+                username: msgUsername,
             }]);
         } catch (err) {
             log.warn("即时消息落盘失败", { chatId, error: String(err) });
@@ -921,10 +945,16 @@ async function main(): Promise<void> {
                     significance: isDM ? 0.8 : 0.6,
                     date: new Date().toISOString(),
                 });
-                // Issue 3: 同步 displayName 到 PersonIdentity
-                if (userId && displayName) {
+                // Issue 3: 同步 displayName 到 PersonIdentity（OneBot 群聊不写入全局 display_name，防止跨群串台）
+                if (userId) {
                     const compositeUid = ensureCompositeId(getPlatform(chatId), userId);
-                    memory.upsertPersonIdentity(compositeUid, { displayName });
+                    if (chatId.startsWith("onebot:group:")) {
+                        if (!memory.getPersonIdentity(compositeUid)) {
+                            memory.upsertPersonIdentity(compositeUid, {});
+                        }
+                    } else if (displayName) {
+                        memory.upsertPersonIdentity(compositeUid, { displayName });
+                    }
                 }
             } catch { /* 非关键路径 */ }
         }

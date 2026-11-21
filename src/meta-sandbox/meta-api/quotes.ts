@@ -70,7 +70,7 @@ export interface QuoteResolverDeps {
         "getRecentInteractions" |
         "getRecentTopics" |
         "queryMessages"
-    >;
+    > & Partial<Pick<MemoryStoreV2, "searchChatNames" | "getChatDisplayName" | "getLatestChatNameForUser" | "sanitizeGroupProfileHistoryAccess">>;
     workspaceRoot?: string;
     getOutput?: (index: number) => QuoteExecutionOutput | null | undefined;
     /**
@@ -315,7 +315,24 @@ function resolveOutputQuote(ref: Extract<ParsedQuoteRef, { kind: "output" }>, de
 }
 
 async function resolvePersonQuote(ref: Extract<ParsedQuoteRef, { kind: "person" }>, deps: QuoteResolverDeps): Promise<ResolvedQuoteItem> {
-    const memoryApi = createMemoryApi(deps.memory as MemoryStoreV2);
+    const ctx = quotePolicyCtx(deps);
+    if (ref.chatId && ctx.enforce !== "off" && ref.chatId !== ctx.boundChatId && isPrivateChat(ref.chatId, ctx.deps)) {
+        return privateQuoteBlocked(ref, "Person");
+    }
+    if (ref.chatId && deps.boundChatId && ref.chatId !== deps.boundChatId) {
+        return {
+            kind: ref.kind,
+            raw: ref.raw,
+            title: `Person ${ref.query}`,
+            content: "",
+            warnings: [`显式作用域 ${ref.chatId} 与派发目标会话 ${deps.boundChatId} 不一致，禁止跨会话按局部名称解析人物`],
+        };
+    }
+    const viewerChatId = deps.boundChatId ?? ref.chatId;
+    const memoryApi = createMemoryApi(
+        deps.memory as MemoryStoreV2,
+        viewerChatId ? { boundChatId: viewerChatId } : undefined,
+    );
     const result = await memoryApi.getPersonDossier(ref.query, {
         chatId: ref.chatId,
         limit: 3,
@@ -325,7 +342,7 @@ async function resolvePersonQuote(ref: Extract<ParsedQuoteRef, { kind: "person" 
         messagesLimit: 5,
         groupProfilesLimit: 5,
     });
-    scrubDossiers(result.dossiers, quotePolicyCtx(deps)); // 私密会话来源的 fact/消息/画像不得被引用带出
+    scrubDossiers(result.dossiers, ctx); // 私密会话来源的 fact/消息/画像不得被引用带出
     const warnings: string[] = [];
     if (result.dossiers.length === 0) {
         warnings.push("没有解析到人物候选");
@@ -333,16 +350,16 @@ async function resolvePersonQuote(ref: Extract<ParsedQuoteRef, { kind: "person" 
     return {
         kind: ref.kind,
         raw: ref.raw,
-        title: `Person ${ref.query}`,
+        title: result.dossiers.length > 0 ? `Person ${ref.query}` : "Person",
         content: result.dossiers.map((dossier, index) => formatPersonDossier(index, dossier)).join("\n\n"),
         warnings,
     };
 }
 
 function resolveHistoryQuote(ref: Extract<ParsedQuoteRef, { kind: "history" }>, deps: QuoteResolverDeps): ResolvedQuoteItem {
-    // 丢弃来源为私密会话的话题，避免私密话题被引用带出。
+    // 丢弃来源为私密会话的话题，避免私密话题被引用带出；历史话题严格按派发目标会话隔离。
     const topics = scrubRowsByVisibility(
-        deps.memory.searchTopics(ref.query, { limit: 5 }),
+        deps.memory.searchTopics(ref.query, { limit: 5, authorizedChatId: deps.boundChatId }),
         (t) => t.chatId,
         quotePolicyCtx(deps),
         "quote.history",
@@ -369,7 +386,16 @@ function resolveTopicQuote(ref: Extract<ParsedQuoteRef, { kind: "topic" }>, deps
     }
     const ctx = quotePolicyCtx(deps);
     if (ctx.enforce !== "off" && topic.chatId !== ctx.boundChatId && isPrivateChat(topic.chatId, ctx.deps)) {
-        return privateQuoteBlocked(ref, `Topic ${topic.label} (${topic.id})`);
+        return privateQuoteBlocked(ref, `话题 ${ref.topicId}`);
+    }
+    if (topic.historyKey != null && topic.chatId !== (deps.boundChatId ?? "")) {
+        return {
+            kind: ref.kind,
+            raw: ref.raw,
+            title: `话题 ${ref.topicId}`,
+            content: "",
+            warnings: ["离线历史话题不可跨会话引用（已被历史隔离拦截）"],
+        };
     }
     return {
         kind: ref.kind,
@@ -641,8 +667,9 @@ function formatTopicNode(topic: TopicNode): string {
 
 function formatPersonDossier(index: number, dossier: Awaited<ReturnType<ReturnType<typeof createMemoryApi>["getPersonDossier"]>>["dossiers"][number]): string {
     const identity = dossier.match.identity;
+    const headerDisplayName = dossier.match.chatName?.displayName || identity.displayName || identity.userId;
     const lines = [
-        `### Candidate ${index + 1}: ${identity.displayName} (${identity.userId})`,
+        `### Candidate ${index + 1}: ${headerDisplayName} (${identity.userId})`,
         dossier.match.matchType ? `matchType: ${dossier.match.matchType}; score=${dossier.match.score}` : "",
         identity.aliases?.length ? `aliases: ${identity.aliases.join(", ")}` : "",
     ].filter(Boolean);

@@ -43,6 +43,17 @@ function normalizeQqImageKey(value: string): string {
     return match ? match[1].toUpperCase() : value;
 }
 
+export function pickOneBotGroupDisplayName(card?: unknown, nickname?: unknown): string | undefined {
+    const cleanCard = typeof card === "string" ? card.trim() : "";
+    if (cleanCard) return cleanCard;
+    const cleanNick = typeof nickname === "string" ? nickname.trim() : "";
+    return cleanNick || undefined;
+}
+
+export interface OneBotAdapterOptions {
+    shouldCacheSender?: (ctx: { chatId: string; userId: string }) => boolean;
+}
+
 type OneBotMessageSegment = {
     type: string;
     data?: Record<string, unknown>;
@@ -56,6 +67,7 @@ type OneBotMentionInfo = {
     displayName?: string;
     isAll?: boolean;
     isSelf?: boolean;
+    nameSource?: "chat" | "account_fallback";
 };
 
 type OneBotIncomingEvent = {
@@ -196,15 +208,20 @@ export class OneBotAdapter implements PlatformAdapter {
     */
     private readonly groupNameCache = new Map<string, string>();
     /** 缓存用户昵称：userId → nickname
-    * OneBot get_stranger_info / get_friend_list 返回 nickname 字段
+    * OneBot get_stranger_info / get_friend_list 返回 nickname 字段（仅用于私聊/账号级回退）
     */
     private readonly userNickCache = new Map<string, string>();
+    /** 缓存群成员名片/群昵称：groupId → (userId → displayName) */
+    private readonly groupMemberNameCache = new Map<string, Map<string, string>>();
+    private readonly groupMemberVersion = new Map<string, number>();
+    private groupMemberSeq = 0;
 
     constructor(
         private config: OneBotConfig,
         private nc: NotificationCenter,
         private mediaDownloader?: MediaDownloader,
         private stickerPolicy?: StickerSendPolicy,
+        private adapterOptions?: OneBotAdapterOptions,
     ) {}
 
     async start(): Promise<void> {
@@ -307,7 +324,7 @@ export class OneBotAdapter implements PlatformAdapter {
                     // 自己发的消息不补抓
                     if (String(patched.user_id ?? patched.sender?.user_id ?? "") === String(this.config.selfId)) continue;
 
-                    const normalized = await this.normalizeIncomingMessage(patched);
+                    const normalized = await this.normalizeIncomingMessage(patched, { isHistoryBackfill: true });
                     if (!normalized || !normalized.messageId || !normalized.text) continue;
                     if (normalized.chatId !== chatId) continue;
                     if (!isNewerThanWatermark(
@@ -1672,12 +1689,38 @@ export class OneBotAdapter implements PlatformAdapter {
         }
 
         if (noticeType === "group_card" || noticeType === "group_card_change") {
-            // 群成员昵称变更（部分实现支持的扩展事件）
-            const userId = String(event.user_id ?? "");
-            const card = String(event.sender?.card ?? (event as Record<string, unknown>).card ?? "");
-            if (userId && card) {
-                this.userNickCache.set(userId, card);
-                log.debug("群名片变更", { userId, card });
+            const rec = event as Record<string, unknown>;
+            const groupId = event.group_id != null ? String(event.group_id).trim() : "";
+            const userId = event.user_id != null ? String(event.user_id).trim() : "";
+            if (!groupId || !userId) return;
+
+            const chatId = composeChatId("onebot", `group:${groupId}`);
+            const compositeUid = composeChatId("onebot", userId);
+            if (this.adapterOptions?.shouldCacheSender && !this.adapterOptions.shouldCacheSender({ chatId, userId: compositeUid })) {
+                return;
+            }
+
+            const hasCardNew = Object.prototype.hasOwnProperty.call(rec, "card_new") && rec.card_new !== undefined;
+            const hasCard = Object.prototype.hasOwnProperty.call(rec, "card") && rec.card !== undefined;
+            const hasSenderCard = !!event.sender && Object.prototype.hasOwnProperty.call(event.sender, "card") && event.sender.card !== undefined;
+            const rawCard = hasCardNew ? rec.card_new : hasCard ? rec.card : hasSenderCard ? event.sender!.card : undefined;
+            const trimmedCard = typeof rawCard === "string" ? rawCard.trim() : "";
+            const trimmedNick = typeof event.sender?.nickname === "string"
+                ? event.sender.nickname.trim()
+                : typeof rec.nickname === "string"
+                    ? rec.nickname.trim()
+                    : "";
+
+            if (trimmedCard) {
+                this.setGroupMemberCachedName(groupId, userId, trimmedCard);
+                log.debug("群名片变更", { groupId, userId, card: trimmedCard });
+            } else if (hasCardNew || hasCard || hasSenderCard) {
+                if (trimmedNick) {
+                    this.setGroupMemberCachedName(groupId, userId, trimmedNick);
+                } else {
+                    this.clearGroupMemberCachedName(groupId, userId);
+                }
+                log.debug("群名片清空", { groupId, userId, fallbackNick: trimmedNick || undefined });
             }
             return;
         }
@@ -1707,12 +1750,21 @@ export class OneBotAdapter implements PlatformAdapter {
             const chatId = isGroup
                 ? composeChatId("onebot", `group:${groupId}`)
                 : composeChatId("onebot", `private:${pokerId}`);
-            const pokerName = await this.fetchMentionDisplayName(pokerId, isGroup ? groupId : undefined) ?? pokerId;
+            const compositePokerUid = composeChatId("onebot", pokerId);
+            const canCachePoker = this.adapterOptions?.shouldCacheSender
+                ? this.adapterOptions.shouldCacheSender({ chatId, userId: compositePokerUid })
+                : true;
+            const pokerResolved = await this.fetchMentionDisplayName(pokerId, isGroup ? groupId : undefined, canCachePoker);
+            const pokerName = pokerResolved?.displayName ?? pokerId;
+            const displayNameSource: "chat" | "account_fallback" = pokerResolved?.nameSource ?? "account_fallback";
             const pokedSelf = targetId === selfId;
+            const targetResolved = !pokedSelf && targetId
+                ? await this.fetchMentionDisplayName(targetId, isGroup ? groupId : undefined, canCachePoker)
+                : undefined;
             const targetName = pokedSelf
                 ? "你"
                 : targetId
-                    ? await this.fetchMentionDisplayName(targetId, isGroup ? groupId : undefined) ?? targetId
+                    ? targetResolved?.displayName ?? targetId
                     : "";
             const text = targetName
                 ? `[👉 戳一戳] ${pokerName} 戳了${targetName === "你" ? "你" : ` ${targetName}`}`
@@ -1721,7 +1773,7 @@ export class OneBotAdapter implements PlatformAdapter {
             const displayName = pokerName;
             const chatTitle = isGroup
                 ? await this.fetchGroupName(groupId) ?? groupId
-                : await this.fetchUserNickname(pokerId) ?? displayName;
+                : await this.fetchUserNickname(pokerId, canCachePoker) ?? displayName;
             const timestamp = new Date((event.time ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
             // 戳一戳没有 message_id；合成唯一 ID 避免 message_log (chat_id, message_id) 主键去重丢事件
             const messageId = `poke_${event.time ?? Date.now()}_${pokerId}_${targetId || "0"}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1730,8 +1782,9 @@ export class OneBotAdapter implements PlatformAdapter {
 
             const core = {
                 chatId,
-                userId: composeChatId("onebot", pokerId),
+                userId: compositePokerUid,
                 displayName,
+                displayNameSource,
                 text,
                 timestamp,
                 messageId,
@@ -1799,7 +1852,7 @@ export class OneBotAdapter implements PlatformAdapter {
      * 异步获取用户昵称，带缓存。
      * 调用 OneBot get_stranger_info API，成功后缓存结果。
      */
-    private async fetchUserNickname(userId: string): Promise<string | undefined> {
+    private async fetchUserNickname(userId: string, allowCacheWrite: boolean = true): Promise<string | undefined> {
         if (this.userNickCache.has(userId)) {
             return this.userNickCache.get(userId)!;
         }
@@ -1808,7 +1861,9 @@ export class OneBotAdapter implements PlatformAdapter {
             const data = (result?.data ?? result) as Record<string, unknown> | undefined;
             const nickname = typeof data?.nickname === "string" ? data.nickname : undefined;
             if (nickname) {
-                this.userNickCache.set(userId, nickname);
+                if (allowCacheWrite) {
+                    this.userNickCache.set(userId, nickname);
+                }
                 log.debug("获取用户昵称成功", { userId, nickname });
             }
             return nickname;
@@ -1818,19 +1873,81 @@ export class OneBotAdapter implements PlatformAdapter {
         }
     }
 
-    private async normalizeIncomingMessage(event: OneBotIncomingEvent): Promise<NormalizedOneBotIncomingMessage | null> {
+    private groupMemberCacheKey(groupId: string, userId: string): string {
+        return `${groupId}\0${userId}`;
+    }
+
+    private getGroupMemberCacheVersion(groupId: string, userId: string): number {
+        return this.groupMemberVersion.get(this.groupMemberCacheKey(groupId, userId)) ?? 0;
+    }
+
+    private bumpGroupMemberCacheVersion(groupId: string, userId: string): number {
+        const next = ++this.groupMemberSeq;
+        this.groupMemberVersion.set(this.groupMemberCacheKey(groupId, userId), next);
+        return next;
+    }
+
+    private setGroupMemberCachedName(groupId: string, userId: string, name: string): number {
+        let groupMap = this.groupMemberNameCache.get(groupId);
+        if (!groupMap) {
+            groupMap = new Map();
+            this.groupMemberNameCache.set(groupId, groupMap);
+        }
+        groupMap.set(userId, name);
+        return this.bumpGroupMemberCacheVersion(groupId, userId);
+    }
+
+    private clearGroupMemberCachedName(groupId: string, userId: string): number {
+        this.groupMemberNameCache.get(groupId)?.delete(userId);
+        return this.bumpGroupMemberCacheVersion(groupId, userId);
+    }
+
+    private async normalizeIncomingMessage(
+        event: OneBotIncomingEvent,
+        opts?: { isHistoryBackfill?: boolean },
+    ): Promise<NormalizedOneBotIncomingMessage | null> {
         const messageType = event.message_type;
         const userId = String(event.user_id ?? event.sender?.user_id ?? "");
         if (!userId) return null;
 
+        const groupId = messageType === "group" ? String(event.group_id ?? "") : "";
         const chatId = messageType === "group"
-            ? composeChatId("onebot", `group:${String(event.group_id ?? "")}`)
+            ? composeChatId("onebot", `group:${groupId}`)
             : composeChatId("onebot", `private:${userId}`);
+        const compositeUserId = composeChatId("onebot", userId);
+
+        const canCacheSender = !opts?.isHistoryBackfill
+            && (this.adapterOptions?.shouldCacheSender
+                ? this.adapterOptions.shouldCacheSender({ chatId, userId: compositeUserId })
+                : true);
+
+        const displayName = pickOneBotGroupDisplayName(event.sender?.card, event.sender?.nickname) ?? userId;
+
+        if (canCacheSender && event.sender) {
+            const trimmedCard = typeof event.sender.card === "string" ? event.sender.card.trim() : "";
+            const trimmedNick = typeof event.sender.nickname === "string" ? event.sender.nickname.trim() : "";
+            const hasExplicitCard = Object.prototype.hasOwnProperty.call(event.sender, "card") && event.sender.card !== undefined;
+
+            if (messageType === "group" && groupId) {
+                if (trimmedCard) {
+                    this.setGroupMemberCachedName(groupId, userId, trimmedCard);
+                } else if (hasExplicitCard) {
+                    if (trimmedNick) {
+                        this.setGroupMemberCachedName(groupId, userId, trimmedNick);
+                    } else {
+                        this.clearGroupMemberCachedName(groupId, userId);
+                    }
+                } else if (trimmedNick && !this.groupMemberNameCache.get(groupId)?.has(userId)) {
+                    this.setGroupMemberCachedName(groupId, userId, trimmedNick);
+                }
+            } else if (messageType !== "group" && trimmedNick) {
+                this.userNickCache.set(userId, trimmedNick);
+            }
+        }
 
         const normalizedMessage = this.normalizeMessageSegments(event.message ?? event.raw_message ?? "");
-        const displayName = event.sender?.card || event.sender?.nickname || userId;
         const messageId = String(event.message_id ?? "");
-        const mentions = await this.extractMentions(normalizedMessage, messageType === "group" ? String(event.group_id ?? "") : undefined);
+        const mentions = await this.extractMentions(normalizedMessage, messageType === "group" ? groupId : undefined, canCacheSender);
         const mentionsAgent = mentions.some(mention => mention.isSelf || mention.isAll);
         const mediaInfo = this.extractMediaInfo(normalizedMessage);
         const mentionLabels = new Map(mentions.map(mention => [mention.rawUserId, mention.displayName ?? mention.rawUserId]));
@@ -1841,24 +1958,18 @@ export class OneBotAdapter implements PlatformAdapter {
         // 异步获取群名或用户昵称作为 chatTitle
         let chatTitle: string | undefined;
         if (messageType === "group") {
-            const groupId = String(event.group_id ?? "");
             chatTitle = await this.fetchGroupName(groupId);
             // 回退：缓存未命中时先用群号，后台获取成功后会在下条消息更新
             if (!chatTitle) chatTitle = groupId;
         } else {
             // 私聊：用对方昵称作为 chatTitle
-            const nickname = await this.fetchUserNickname(userId);
+            const nickname = await this.fetchUserNickname(userId, canCacheSender);
             chatTitle = nickname || displayName;
-        }
-
-        // 缓存发送者昵称（群聊时也缓存群成员昵称）
-        if (event.sender?.nickname && userId) {
-            this.userNickCache.set(userId, event.sender.nickname);
         }
 
         return {
             chatId,
-            userId: composeChatId("onebot", userId),
+            userId: compositeUserId,
             displayName,
             username: undefined,
             text: normalizedText,
@@ -1940,7 +2051,11 @@ export class OneBotAdapter implements PlatformAdapter {
             .replaceAll("&amp;", "&");
     }
 
-    private async extractMentions(message: OneBotMessageSegment[], groupId?: string): Promise<OneBotMentionInfo[]> {
+    private async extractMentions(
+        message: OneBotMessageSegment[],
+        groupId?: string,
+        allowCacheWrite: boolean = true,
+    ): Promise<OneBotMentionInfo[]> {
         const result: OneBotMentionInfo[] = [];
         const seen = new Set<string>();
         for (const seg of message) {
@@ -1953,25 +2068,32 @@ export class OneBotAdapter implements PlatformAdapter {
 
             const isAll = rawUserId.toLowerCase() === "all";
             const isSelf = !isAll && rawUserId === String(this.config.selfId);
-            const displayName = isAll
-                ? "全体成员"
-                : await this.fetchMentionDisplayName(rawUserId, groupId);
+            const resolved = isAll
+                ? { displayName: "全体成员", nameSource: undefined }
+                : await this.fetchMentionDisplayName(rawUserId, groupId, allowCacheWrite);
             result.push({
                 userId: isAll ? "onebot:all" : composeChatId("onebot", rawUserId),
                 rawUserId,
-                displayName,
+                displayName: resolved?.displayName,
                 isAll,
                 isSelf,
+                ...(resolved?.nameSource ? { nameSource: resolved.nameSource } : {}),
             });
         }
         return result;
     }
 
-    private async fetchMentionDisplayName(userId: string, groupId?: string): Promise<string | undefined> {
-        if (this.userNickCache.has(userId)) {
-            return this.userNickCache.get(userId)!;
-        }
+    private async fetchMentionDisplayName(
+        userId: string,
+        groupId?: string,
+        allowCacheWrite: boolean = true,
+    ): Promise<{ displayName: string; nameSource: "chat" | "account_fallback" } | undefined> {
         if (groupId) {
+            const cached = this.groupMemberNameCache.get(groupId)?.get(userId);
+            if (cached) {
+                return { displayName: cached, nameSource: "chat" };
+            }
+            const startVersion = this.getGroupMemberCacheVersion(groupId, userId);
             try {
                 const result = await this.callAction("get_group_member_info", {
                     group_id: Number(groupId),
@@ -1979,18 +2101,29 @@ export class OneBotAdapter implements PlatformAdapter {
                     no_cache: false,
                 }) as Record<string, unknown>;
                 const data = (result?.data ?? result) as Record<string, unknown> | undefined;
-                const card = typeof data?.card === "string" && data.card.trim() ? data.card : undefined;
-                const nickname = typeof data?.nickname === "string" && data.nickname.trim() ? data.nickname : undefined;
-                const name = card ?? nickname;
+                const name = pickOneBotGroupDisplayName(data?.card, data?.nickname);
                 if (name) {
-                    this.userNickCache.set(userId, name);
-                    return name;
+                    if (this.getGroupMemberCacheVersion(groupId, userId) === startVersion) {
+                        if (allowCacheWrite) {
+                            this.setGroupMemberCachedName(groupId, userId, name);
+                        }
+                        return { displayName: name, nameSource: "chat" };
+                    }
+                    const latestCached = this.groupMemberNameCache.get(groupId)?.get(userId);
+                    if (latestCached) {
+                        return { displayName: latestCached, nameSource: "chat" };
+                    }
+                    // Version changed while lookup was in-flight and cache was explicitly cleared;
+                    // discard stale lookup response instead of returning it as trusted chat evidence.
                 }
             } catch (err) {
                 log.debug("获取被 @ 群成员昵称失败", { groupId, userId, error: String(err) });
             }
+            const fallbackNick = this.userNickCache.get(userId) ?? await this.fetchUserNickname(userId, allowCacheWrite);
+            return fallbackNick ? { displayName: fallbackNick, nameSource: "account_fallback" } : undefined;
         }
-        return this.fetchUserNickname(userId);
+        const privateNick = this.userNickCache.get(userId) ?? await this.fetchUserNickname(userId, allowCacheWrite);
+        return privateNick ? { displayName: privateNick, nameSource: "chat" } : undefined;
     }
 
     private extractText(message: OneBotMessageSegment[], mentionLabels?: Map<string, string>): string {

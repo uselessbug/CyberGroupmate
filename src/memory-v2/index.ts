@@ -6,6 +6,52 @@
  */
 
 export { MemoryStoreV2 } from "./memory-v2.js";
+export {
+    cleanDisplayName,
+    collectChatNamesFromMessage,
+    normalizeChatNameKey,
+    chatNameKindRank,
+    type ChatNameHit,
+    type ChatNameKind,
+    type ChatNameObservation,
+    type LatestChatNameRecord,
+} from "./chat-names.js";
+export {
+    HistoryStore,
+    HistoryLeaseError,
+    HistoryUnitStaleError,
+    NEWCOMER_AGENT_ROLE,
+    computeMessagesDigest,
+    computeEmbeddingContentHash,
+    computeStatsHour,
+    type ChatActivityStats,
+    type DigestMessageFields,
+    type HistoryCheckpoint,
+    type HistoryClusterCommitInput,
+    type HistoryClusterCommitResult,
+    type HistoryClusterTopicInput,
+    type HistoryEmbeddingCommitInput,
+    type HistoryFinalizeQceImportInput,
+    type HistoryJobKind,
+    type HistoryJobRecord,
+    type HistoryJobStatus,
+    type HistoryLease,
+    type HistorySynthesisCitation,
+    type HistorySynthesisCommitInput,
+    type HistorySynthesisCommitResult,
+    type HistorySynthesisEpisodeInput,
+    type HistorySynthesisExpectedEvidence,
+    type HistorySynthesisFactProposal,
+    type HistorySynthesisGroupPatch,
+    type HistorySynthesisMemberPatch,
+    type HistoryUnitInput,
+    type HistoryUnitRecord,
+    type HistoryUnitStage,
+    type IngestBatchResult,
+    type IngestMessage,
+    type MessageOrigin,
+    type UpsertHistoryJobInput,
+} from "./history-store.js";
 export { runReflection, parseReflectionJSON, mergeEpisodes, trimProfileByTier, mergeGlobalPersonProfile, mergeProfileList, DEFAULT_TIER_LIMITS, isSizeReducibleError, REFLECTION_SCOPE_LEVELS, type TierLimitEntry, type TierLimitsConfig, type ReflectionScope } from "./reflection.js";
 export type { ReflectionExternalConfig as ReflectionConfig } from "../core/config.js";
 
