@@ -48,22 +48,34 @@ import {
 import {
     HistoryStore,
     type ChatActivityStats,
+    type EditHistoryFactInput,
+    type EditHistoryFactResult,
     type HistoryCheckpoint,
     type HistoryClusterCommitInput,
     type HistoryClusterCommitResult,
+    type HistoryDashboardFactItem,
     type HistoryEmbeddingCommitInput,
+    type HistoryFactEvidenceResult,
+    type HistoryFactKind,
+    type HistoryFactReviewAction,
+    type HistoryFactReviewStatus,
+    type HistoryFactSort,
     type HistoryFinalizeQceImportInput,
     type HistoryJobKind,
     type HistoryJobRecord,
     type HistoryJobStatus,
     type HistoryLease,
+    type HistoryOverviewChatRecord,
     type HistorySynthesisCommitInput,
     type HistorySynthesisCommitResult,
+    type HistorySynthesisProtectionData,
     type HistoryUnitInput,
     type HistoryUnitRecord,
     type HistoryUnitStage,
     type IngestBatchResult,
     type IngestMessage,
+    type ListHistoryFactsOptions,
+    type ListHistoryFactsResult,
     type MemeVariantUsageCounts,
     type UpsertHistoryJobInput,
 } from "./history-store.js";
@@ -539,6 +551,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 visibility TEXT DEFAULT 'contextual',
                 sensitivity TEXT DEFAULT 'low',
                 history_key TEXT,
+                history_review TEXT,
                 embedding BLOB,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -693,6 +706,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         this.ensureColumn("core_facts", "visibility", "TEXT DEFAULT 'contextual'");
         this.ensureColumn("core_facts", "sensitivity", "TEXT DEFAULT 'low'");
         this.ensureColumn("core_facts", "history_key", "TEXT");
+        this.ensureColumn("core_facts", "history_review", "TEXT");
         this.db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_source_chat ON core_facts(source_chat_id)`);
 
         this.ensureColumn("topics", "associated_memories", "TEXT DEFAULT '[]'");
@@ -814,6 +828,16 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 owner_token TEXT NOT NULL,
                 expires_at_ms INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS history_fact_rejections (
+                chat_id TEXT NOT NULL,
+                history_key TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                fact_json TEXT NOT NULL,
+                rejected_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, history_key)
+            ) WITHOUT ROWID;
         `);
     }
 
@@ -1548,6 +1572,46 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         this.historyStore.commitHistoricalEmbeddingUnit(input);
     }
 
+    getHistoryLease(chatId: string): HistoryLease | null {
+        return this.historyStore.getHistoryLease(chatId);
+    }
+
+    listCompletedHistoryUnitKeys(
+        chatId: string,
+        kind: HistoryJobKind,
+        stage: HistoryUnitStage,
+    ): Set<string> {
+        return this.historyStore.listCompletedHistoryUnitKeys(chatId, kind, stage);
+    }
+
+    getSynthesisProtectionData(chatId: string): HistorySynthesisProtectionData {
+        return this.historyStore.getSynthesisProtectionData(chatId);
+    }
+
+    listHistoryFacts(options: ListHistoryFactsOptions): ListHistoryFactsResult {
+        return this.historyStore.listHistoryFacts(options);
+    }
+
+    reviewHistoryFacts(
+        chatId: string,
+        action: HistoryFactReviewAction,
+        historyKeys: readonly string[],
+    ): number {
+        return this.historyStore.reviewHistoryFacts(chatId, action, historyKeys);
+    }
+
+    editHistoryFact(input: EditHistoryFactInput): EditHistoryFactResult {
+        return this.historyStore.editHistoryFact(input);
+    }
+
+    getHistoryFactEvidence(chatId: string, historyKey: string): HistoryFactEvidenceResult | null {
+        return this.historyStore.getHistoryFactEvidence(chatId, historyKey);
+    }
+
+    getHistoryOverviewChats(activeRunnerChatId: string | null): HistoryOverviewChatRecord[] {
+        return this.historyStore.getHistoryOverviewChats(activeRunnerChatId);
+    }
+
     /** 按确定性时间序分页读取 message_log 中的可聚类历史消息（供离线窗口切分使用） */
     listEligibleHistoryMessagePage(
         chatId: string,
@@ -2216,6 +2280,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             visibility: ((row.visibility as string) ?? "contextual") as CoreFact["visibility"],
             sensitivity: ((row.sensitivity as string) ?? "low") as CoreFact["sensitivity"],
             historyKey: (row.history_key as string) ?? null,
+            historyReview: (row.history_review as "approved" | null) ?? null,
             createdAt: row.created_at as string,
             updatedAt: row.updated_at as string,
             expiresAt: (row.expires_at as string) ?? null,
@@ -4666,6 +4731,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 visibility: ((row.visibility as string) ?? "contextual") as CoreFact["visibility"],
                 sensitivity: ((row.sensitivity as string) ?? "low") as CoreFact["sensitivity"],
                 historyKey: (row.history_key as string) ?? null,
+                historyReview: (row.history_review as "approved" | null) ?? null,
                 createdAt: row.created_at as string,
                 updatedAt: row.updated_at as string,
                 expiresAt: (row.expires_at as string) ?? null,
@@ -4680,6 +4746,11 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         confidence?: number;
         expiresAt?: string | null;
     } & CoreFactProvenance): boolean {
+        const existing = this.db.prepare(
+            "SELECT rowid, subject, content, history_key FROM core_facts WHERE id = ?"
+        ).get(id) as { rowid: number; subject: string; content: string; history_key: string | null } | undefined;
+        if (!existing) return false;
+
         const ts = now();
         const builder = new SafeUpdateBuilder("core_facts");
         if (data.content !== undefined) builder.set("content", data.content);
@@ -4695,6 +4766,13 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         if (data.observedAt !== undefined) builder.set("observed_at", data.observedAt);
         if (data.visibility !== undefined) builder.set("visibility", data.visibility);
         if (data.sensitivity !== undefined) builder.set("sensitivity", data.sensitivity);
+        if (existing.history_key !== null) {
+            builder.set("history_review", "approved");
+        }
+        const contentChanged = data.content !== undefined && data.content !== existing.content;
+        if (contentChanged) {
+            builder.set("embedding", null);
+        }
         builder.set("updated_at", ts);
         builder.where("id", id);
 
@@ -4702,14 +4780,17 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const { sql, params } = builder.build();
         const result = this.db.prepare(sql).run(...params);
 
+        if (result.changes > 0 && contentChanged && this.sqliteVecAvailable) {
+            try {
+                this.db.prepare("DELETE FROM facts_vec WHERE fact_id = ?").run(id);
+            } catch { /* vec cleanup */ }
+        }
+
         // 同步 FTS5
         if (data.content !== undefined) {
             try {
-                const row = this.db.prepare("SELECT rowid, subject FROM core_facts WHERE id = ?").get(id) as { rowid: number; subject: string } | undefined;
-                if (row) {
-                    this.db.prepare("DELETE FROM core_facts_fts WHERE rowid = ?").run(row.rowid);
-                    this.db.prepare("INSERT INTO core_facts_fts(rowid, content, subject) VALUES (?, ?, ?)").run(row.rowid, data.content, row.subject);
-                }
+                this.db.prepare("DELETE FROM core_facts_fts WHERE rowid = ?").run(existing.rowid);
+                this.db.prepare("INSERT INTO core_facts_fts(rowid, content, subject) VALUES (?, ?, ?)").run(existing.rowid, data.content, existing.subject);
             } catch { /* FTS sync */ }
         }
 

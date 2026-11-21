@@ -32,7 +32,7 @@ export const COLUMN_WHITELIST = {
         "subject", "content", "category", "confidence", "source",
         "source_chat_id", "source_chat_title", "source_topic_id", "source_topic_label",
         "source_message_ids", "source_interaction_ids", "observed_at",
-        "visibility", "sensitivity", "history_key", "embedding", "created_at", "updated_at", "expires_at",
+        "visibility", "sensitivity", "history_key", "history_review", "embedding", "created_at", "updated_at", "expires_at",
     ],
     person_profiles: [
         "traits", "interests", "communication_style", "relation_to_agent",

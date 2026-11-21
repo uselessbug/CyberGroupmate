@@ -1298,9 +1298,11 @@ async function main(): Promise<void> {
     const dashboardEnabled = appConfig.dashboard?.enabled !== false;
     let dashboardServer: { stop: () => void } | null = null;
     let dashboardDeps: import("./dashboard/types.js").DashboardDeps | null = null;
+    let historyRunner: import("./history/runner.js").HistoryInitRunner | null = null;
     if (dashboardEnabled) {
         const { DashboardServer } = await import("./dashboard/dashboard-server.js");
         const { TokenStatsCollector } = await import("./dashboard/token-stats.js");
+        const { HistoryInitRunner } = await import("./history/runner.js");
         const dashboardHost = appConfig.dashboard?.host ?? "127.0.0.1";
         const dashboardToken = appConfig.dashboard?.token ?? "cybergroupmate";
         const dashboardPort = appConfig.dashboard?.port ?? 6767;
@@ -1316,6 +1318,8 @@ async function main(): Promise<void> {
         // 进程退出时保存统计
         process.on("exit", () => tokenStats.shutdown());
 
+        historyRunner = new HistoryInitRunner({ memory });
+
         dashboardDeps = {
                 nc,
                 subagentManager,
@@ -1326,6 +1330,7 @@ async function main(): Promise<void> {
                 sandboxPool,
                 memory,
                 tokenStats,
+                historyRunner,
                 mediaDownloader: sharedMediaDownloader,
                 imageCatalog,
                 adapters,
@@ -1801,6 +1806,13 @@ async function main(): Promise<void> {
         subagentManager.dispose();
 
         // 停止 dashboard / metrics 导出
+        if (historyRunner) {
+            try {
+                await runWithTimeout("historyRunner.shutdown", () => historyRunner!.shutdown(), 5_000);
+            } catch (err) {
+                log.warn("historyRunner shutdown 失败", { error: String(err) });
+            }
+        }
         try {
             dashboardServer?.stop();
         } catch (err) {

@@ -1,14 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { safeGroupModelKey } from "../core/chat-id.js";
+import { getRawId, safeGroupModelKey } from "../core/chat-id.js";
 import { readMessageMentions } from "../core/message-provenance.js";
 import { getGlobalTimezone } from "../core/timezone.js";
 import {
     collectChatNamesFromMessage,
     insertChatNameObservations,
+    resolveLatestChatDisplayNames,
     type ChatNameObservation,
 } from "./chat-names.js";
 import { embeddingToBuffer } from "./embedding.js";
+import {
+    buildMemeFactContent,
+    computeMemeFlags,
+    parseMemeFactContent,
+    type MemeFlag,
+    type MemeUsageInfo,
+} from "./meme-format.js";
 import {
     extractMemeTermFromFactContent,
     extractNormalizedMemeVariants,
@@ -58,6 +66,123 @@ export interface ChatActivityStats {
 export interface MemeVariantUsageCounts {
     messageCount: number;
     senderCount: number;
+}
+
+export type HistoryFactKind = "meme" | "observation";
+export type HistoryFactReviewStatus = "pending" | "approved" | "rejected";
+export type HistoryFactSort = "recent" | "usage_desc" | "usage_asc";
+export type HistoryFactReviewAction = "approve" | "reject" | "reset" | "restore";
+
+export interface HistoryDashboardFactItem {
+    historyKey: string;
+    kind: HistoryFactKind;
+    status: HistoryFactReviewStatus;
+    content: string;
+    meme: {
+        term: string;
+        variants: string[];
+        meaning: string;
+        originContext: string;
+        usageBoundaries: string;
+        participants: Array<{ userId: string; displayName: string }>;
+        usage: MemeUsageInfo | null;
+    } | null;
+    sourceTopicLabel: string | null;
+    citedCount: number;
+    observedAt: string;
+    flags: MemeFlag[];
+}
+
+export interface ListHistoryFactsOptions {
+    chatId: string;
+    kind: HistoryFactKind;
+    status: HistoryFactReviewStatus;
+    q?: string;
+    sort?: HistoryFactSort;
+    limit?: number;
+    offset?: number;
+}
+
+export interface ListHistoryFactsResult {
+    total: number;
+    counts: {
+        pending: number;
+        approved: number;
+        rejected: number;
+    };
+    items: HistoryDashboardFactItem[];
+}
+
+export interface HistoryFactEvidenceResult {
+    topic: { id: string; label: string; summary: string } | null;
+    messages: Array<{
+        messageId: string;
+        userId: string;
+        displayName: string;
+        timestamp: string;
+        text: string;
+    }>;
+    missing: number;
+}
+
+export interface EditHistoryFactInput {
+    chatId: string;
+    historyKey: string;
+    meme?: {
+        term: string;
+        meaning: string;
+        originContext?: string;
+        usageBoundaries: string;
+    };
+    content?: string;
+}
+
+export type EditHistoryFactResult =
+    | { status: "ok"; item: HistoryDashboardFactItem }
+    | { status: "not_found" }
+    | { status: "invalid"; error: string };
+
+export interface HistoryOverviewChatRecord {
+    chatId: string;
+    chatTitle: string;
+    messages: {
+        imported: number;
+        eligible: number;
+        covered: number;
+        earliest: string | null;
+        latest: string | null;
+    };
+    topics: number;
+    facts: {
+        meme: { pending: number; approved: number; rejected: number };
+        observation: { pending: number; approved: number; rejected: number };
+    };
+    importJobs: Array<{
+        jobId: string;
+        status: HistoryJobStatus;
+        updatedAt: string;
+        inputKeyShort: string;
+    }>;
+    initJob: {
+        jobId: string;
+        mode: "quick" | "full";
+        status: "running" | "paused" | "done" | "stale";
+        updatedAt: string;
+        error: string | null;
+        stages: {
+            cluster: { done: number; total: number };
+            synthesize: { done: number; total: number };
+            embed: { done: number; total: number };
+        };
+        resumable: boolean;
+    } | null;
+}
+
+export interface HistorySynthesisProtectionData {
+    approvedKeys: Set<string>;
+    rejectedKeys: Set<string>;
+    rejectedMemeVariants: Set<string>;
+    rejectedObservations: string[];
 }
 
 export class HistoryLeaseError extends Error {
@@ -1958,7 +2083,7 @@ export class HistoryStore {
             const chatTitle = (groupRow.chat_title as string) || input.chatId;
             const visibility = liveSensitive ? "private" : "contextual";
             const selectFactByKey = this.db.prepare(`
-                SELECT id, subject, content FROM core_facts WHERE source_chat_id = ? AND history_key = ?
+                SELECT id, subject, content, history_review FROM core_facts WHERE source_chat_id = ? AND history_key = ?
             `);
             const selectFactById = this.db.prepare(`
                 SELECT id, history_key FROM core_facts WHERE id = ?
@@ -1987,9 +2112,9 @@ export class HistoryStore {
                     id, subject, content, category, confidence, source,
                     source_chat_id, source_chat_title, source_topic_id, source_topic_label,
                     source_message_ids, source_interaction_ids, observed_at,
-                    visibility, sensitivity, history_key, embedding, created_at, updated_at, expires_at
+                    visibility, sensitivity, history_key, history_review, embedding, created_at, updated_at, expires_at
                 )
-                VALUES (?, ?, ?, ?, ?, 'offline_history', ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, NULL, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, 'offline_history', ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, NULL, NULL, ?, ?, NULL)
             `);
             const selectFactFtsStmt = this.db.prepare(`
                 SELECT rowid, content, subject FROM core_facts WHERE id = ?
@@ -2019,18 +2144,47 @@ export class HistoryStore {
             `).all(input.chatId, expectedSubject) as Array<{ id: string; content: string; history_key: string | null }>;
             const knownMemeVariants = new Set<string>();
             for (const row of storedMemeRows) {
-                const term = extractMemeTermFromFactContent(row.content);
+                const term = extractMemeTermFromFactContent(row.content)
+                    ?? (parseMemeFactContent(row.content).term || null);
                 if (!term) continue;
                 for (const v of extractNormalizedMemeVariants(term)) {
                     knownMemeVariants.add(v);
                 }
             }
 
+            const rejectionRows = this.db.prepare(`
+                SELECT history_key, category, content
+                FROM history_fact_rejections
+                WHERE chat_id = ?
+            `).all(input.chatId) as Array<{ history_key: string; category: string; content: string }>;
+            const rejectedKeys = new Set<string>();
+            const rejectedMemeVariants = new Set<string>();
+            const rejectedObservations: string[] = [];
+            for (const rej of rejectionRows) {
+                rejectedKeys.add(rej.history_key);
+                if (rej.category === "anecdote") {
+                    const term = extractMemeTermFromFactContent(rej.content)
+                        ?? (parseMemeFactContent(rej.content).term || null);
+                    if (!term) continue;
+                    for (const v of extractNormalizedMemeVariants(term)) {
+                        rejectedMemeVariants.add(v);
+                    }
+                } else if (rej.category === "general") {
+                    rejectedObservations.push(rej.content);
+                }
+            }
+
             let factsCommitted = 0;
             for (const fact of input.factProposals) {
+                if (rejectedKeys.has(fact.historyKey)) {
+                    continue;
+                }
                 const existingByKey = selectFactByKey.get(input.chatId, fact.historyKey) as
-                    | { id: string; subject: string; content: string }
+                    | { id: string; subject: string; content: string; history_review: string | null }
                     | undefined;
+                if (existingByKey?.history_review === "approved") {
+                    continue;
+                }
                 if (!existingByKey && fact.id) {
                     const existingById = selectFactById.get(fact.id) as { id: string; history_key: string | null } | undefined;
                     if (existingById && existingById.history_key === null) {
@@ -2038,16 +2192,23 @@ export class HistoryStore {
                         continue;
                     }
                 }
-                if (!existingByKey && fact.category === "general") {
-                    if (storedGroupObservations.some(obs => isNearDuplicateText(obs.content, fact.content))) {
+                if (fact.category === "general") {
+                    if (rejectedObservations.some(rej => isNearDuplicateText(rej, fact.content))) {
+                        continue;
+                    }
+                    if (!existingByKey && storedGroupObservations.some(obs => isNearDuplicateText(obs.content, fact.content))) {
                         continue;
                     }
                 }
                 let incomingMemeVariants: string[] = [];
-                if (!existingByKey && fact.category === "anecdote") {
-                    const term = extractMemeTermFromFactContent(fact.content);
+                if (fact.category === "anecdote") {
+                    const term = extractMemeTermFromFactContent(fact.content)
+                        ?? (parseMemeFactContent(fact.content).term || null);
                     incomingMemeVariants = term ? extractNormalizedMemeVariants(term) : [];
-                    if (incomingMemeVariants.length > 0 && hasOverlappingMemeVariant(incomingMemeVariants, knownMemeVariants)) {
+                    if (incomingMemeVariants.length > 0 && hasOverlappingMemeVariant(incomingMemeVariants, rejectedMemeVariants)) {
+                        continue;
+                    }
+                    if (!existingByKey && incomingMemeVariants.length > 0 && hasOverlappingMemeVariant(incomingMemeVariants, knownMemeVariants)) {
                         continue;
                     }
                 }
@@ -2237,6 +2398,1066 @@ export class HistoryStore {
                 unitKey,
             );
         }
+    }
+
+    getHistoryLease(chatId: string): HistoryLease | null {
+        const cleanChatId = chatId.trim();
+        if (!cleanChatId) return null;
+        const row = this.db.prepare(`
+            SELECT owner_token, expires_at_ms
+            FROM history_leases
+            WHERE chat_id = ?
+        `).get(cleanChatId) as { owner_token: string; expires_at_ms: number } | undefined;
+        return row ? { ownerToken: row.owner_token, expiresAtMs: row.expires_at_ms } : null;
+    }
+
+    listCompletedHistoryUnitKeys(
+        chatId: string,
+        kind: HistoryJobKind,
+        stage: HistoryUnitStage,
+    ): Set<string> {
+        const rows = this.db.prepare(`
+            SELECT DISTINCT hu.unit_key
+            FROM history_units hu
+            INNER JOIN history_jobs hj ON hj.job_id = hu.job_id
+            WHERE hj.kind = ? AND hj.chat_id = ? AND hu.stage = ? AND hu.completed_at IS NOT NULL
+        `).all(kind, chatId, stage) as Array<{ unit_key: string }>;
+        return new Set(rows.map(r => r.unit_key));
+    }
+
+    getSynthesisProtectionData(chatId: string): HistorySynthesisProtectionData {
+        const approvedRows = this.db.prepare(`
+            SELECT history_key
+            FROM core_facts
+            WHERE source_chat_id = ?
+              AND history_key IS NOT NULL
+              AND history_review = 'approved'
+              AND (expires_at IS NULL OR expires_at > datetime('now'))
+        `).all(chatId) as Array<{ history_key: string }>;
+        const approvedKeys = new Set(approvedRows.map(r => r.history_key));
+
+        const rejectionRows = this.db.prepare(`
+            SELECT history_key, category, content
+            FROM history_fact_rejections
+            WHERE chat_id = ?
+        `).all(chatId) as Array<{ history_key: string; category: string; content: string }>;
+        const rejectedKeys = new Set<string>();
+        const rejectedMemeVariants = new Set<string>();
+        const rejectedObservations: string[] = [];
+
+        for (const rej of rejectionRows) {
+            rejectedKeys.add(rej.history_key);
+            if (rej.category === "anecdote") {
+                const term = extractMemeTermFromFactContent(rej.content)
+                    ?? (parseMemeFactContent(rej.content).term || null);
+                if (term) {
+                    for (const v of extractNormalizedMemeVariants(term)) {
+                        rejectedMemeVariants.add(v);
+                    }
+                }
+            } else if (rej.category === "general") {
+                rejectedObservations.push(rej.content);
+            }
+        }
+
+        return {
+            approvedKeys,
+            rejectedKeys,
+            rejectedMemeVariants,
+            rejectedObservations,
+        };
+    }
+
+    private formatDashboardFactItem(params: {
+        chatId: string;
+        historyKey: string;
+        kind: HistoryFactKind;
+        status: HistoryFactReviewStatus;
+        content: string;
+        sourceTopicLabel: string | null;
+        sourceMessageIds: readonly string[];
+        observedAt: string;
+        displayNames: ReadonlyMap<string, string>;
+    }): HistoryDashboardFactItem {
+        if (params.kind === "meme") {
+            const parsed = parseMemeFactContent(params.content);
+            const flags = computeMemeFlags(parsed.variants, parsed.usage);
+            return {
+                historyKey: params.historyKey,
+                kind: "meme",
+                status: params.status,
+                content: params.content,
+                meme: {
+                    term: parsed.term,
+                    variants: parsed.variants,
+                    meaning: parsed.meaning,
+                    originContext: parsed.originContext,
+                    usageBoundaries: parsed.usageBoundaries,
+                    participants: parsed.participants.map(uid => ({
+                        userId: uid,
+                        displayName: params.displayNames.get(uid)?.trim() || getRawId(uid),
+                    })),
+                    usage: parsed.usage,
+                },
+                sourceTopicLabel: params.sourceTopicLabel,
+                citedCount: params.sourceMessageIds.length,
+                observedAt: params.observedAt,
+                flags,
+            };
+        }
+        return {
+            historyKey: params.historyKey,
+            kind: "observation",
+            status: params.status,
+            content: params.content,
+            meme: null,
+            sourceTopicLabel: params.sourceTopicLabel,
+            citedCount: params.sourceMessageIds.length,
+            observedAt: params.observedAt,
+            flags: [],
+        };
+    }
+
+    listHistoryFacts(options: ListHistoryFactsOptions): ListHistoryFactsResult {
+        const chatId = options.chatId.trim();
+        const kind = options.kind;
+        const category: FactCategory = kind === "meme" ? "anecdote" : "general";
+        const status = options.status;
+        const sort: HistoryFactSort = options.sort ?? "recent";
+        const limit = Math.min(Math.max(Math.floor(options.limit ?? 30), 1), 100);
+        const offset = Math.max(Math.floor(options.offset ?? 0), 0);
+        const qLower = (options.q ?? "").trim().toLowerCase();
+
+        const liveCountRows = this.db.prepare(`
+            SELECT
+                CASE WHEN history_review = 'approved' THEN 'approved' ELSE 'pending' END AS status,
+                COUNT(*) AS cnt
+            FROM core_facts
+            WHERE source_chat_id = ?
+              AND history_key IS NOT NULL
+              AND category = ?
+              AND (expires_at IS NULL OR expires_at > datetime('now'))
+            GROUP BY CASE WHEN history_review = 'approved' THEN 'approved' ELSE 'pending' END
+        `).all(chatId, category) as Array<{ status: "pending" | "approved"; cnt: number }>;
+
+        let pendingCount = 0;
+        let approvedCount = 0;
+        for (const r of liveCountRows) {
+            if (r.status === "approved") approvedCount = Number(r.cnt);
+            else pendingCount = Number(r.cnt);
+        }
+
+        const rejectedCountRow = this.db.prepare(`
+            SELECT COUNT(*) AS cnt
+            FROM history_fact_rejections
+            WHERE chat_id = ? AND category = ?
+        `).get(chatId, category) as { cnt: number } | undefined;
+        const rejectedCount = Number(rejectedCountRow?.cnt ?? 0);
+
+        interface RawCandidate {
+            historyKey: string;
+            content: string;
+            sourceTopicLabel: string | null;
+            sourceMessageIds: string[];
+            observedAt: string;
+            parsedMeme: ReturnType<typeof parseMemeFactContent> | null;
+        }
+
+        const candidates: RawCandidate[] = [];
+        if (status === "rejected") {
+            const rows = this.db.prepare(`
+                SELECT history_key, content, fact_json, rejected_at
+                FROM history_fact_rejections
+                WHERE chat_id = ? AND category = ?
+            `).all(chatId, category) as Array<{
+                history_key: string;
+                content: string;
+                fact_json: string;
+                rejected_at: string;
+            }>;
+
+            for (const r of rows) {
+                const snap = parseJsonSafe<Record<string, unknown>>(r.fact_json, {});
+                const sourceTopicLabel = typeof snap.source_topic_label === "string" && snap.source_topic_label.trim()
+                    ? snap.source_topic_label
+                    : null;
+                if (qLower) {
+                    const inContent = r.content.toLowerCase().includes(qLower);
+                    const inTopic = (sourceTopicLabel ?? "").toLowerCase().includes(qLower);
+                    if (!inContent && !inTopic) continue;
+                }
+                const rawMsgIds = typeof snap.source_message_ids === "string"
+                    ? parseJsonSafe<string[]>(snap.source_message_ids, [])
+                    : (Array.isArray(snap.source_message_ids) ? snap.source_message_ids.map(String) : []);
+                const observedAt = (typeof snap.observed_at === "string" && snap.observed_at)
+                    || (typeof snap.created_at === "string" && snap.created_at)
+                    || r.rejected_at;
+                candidates.push({
+                    historyKey: r.history_key,
+                    content: r.content,
+                    sourceTopicLabel,
+                    sourceMessageIds: rawMsgIds,
+                    observedAt,
+                    parsedMeme: kind === "meme" ? parseMemeFactContent(r.content) : null,
+                });
+            }
+        } else {
+            const reviewCond = status === "approved"
+                ? "history_review = 'approved'"
+                : "(history_review IS NULL OR history_review != 'approved')";
+            const rows = this.db.prepare(`
+                SELECT history_key, content, source_topic_label, source_message_ids, observed_at, created_at
+                FROM core_facts
+                WHERE source_chat_id = ?
+                  AND history_key IS NOT NULL
+                  AND category = ?
+                  AND ${reviewCond}
+                  AND (expires_at IS NULL OR expires_at > datetime('now'))
+            `).all(chatId, category) as Array<{
+                history_key: string;
+                content: string;
+                source_topic_label: string | null;
+                source_message_ids: string | null;
+                observed_at: string | null;
+                created_at: string;
+            }>;
+
+            for (const r of rows) {
+                const sourceTopicLabel = r.source_topic_label?.trim() ? r.source_topic_label : null;
+                if (qLower) {
+                    const inContent = r.content.toLowerCase().includes(qLower);
+                    const inTopic = (sourceTopicLabel ?? "").toLowerCase().includes(qLower);
+                    if (!inContent && !inTopic) continue;
+                }
+                candidates.push({
+                    historyKey: r.history_key,
+                    content: r.content,
+                    sourceTopicLabel,
+                    sourceMessageIds: parseJsonSafe<string[]>(r.source_message_ids, []),
+                    observedAt: r.observed_at || r.created_at,
+                    parsedMeme: kind === "meme" ? parseMemeFactContent(r.content) : null,
+                });
+            }
+        }
+
+        const effectiveSort: HistoryFactSort = kind === "observation" ? "recent" : sort;
+        const compareRecent = (a: RawCandidate, b: RawCandidate): number => {
+            const ta = Date.parse(a.observedAt);
+            const tb = Date.parse(b.observedAt);
+            if (Number.isFinite(ta) && Number.isFinite(tb) && tb !== ta) {
+                return tb - ta;
+            }
+            if (b.observedAt !== a.observedAt) {
+                return b.observedAt.localeCompare(a.observedAt);
+            }
+            return a.historyKey.localeCompare(b.historyKey);
+        };
+
+        candidates.sort((a, b) => {
+            if (effectiveSort === "usage_desc") {
+                const ma = a.parsedMeme?.usage?.messages ?? -1;
+                const mb = b.parsedMeme?.usage?.messages ?? -1;
+                if (mb !== ma) return mb - ma;
+                const sa = a.parsedMeme?.usage?.senders ?? -1;
+                const sb = b.parsedMeme?.usage?.senders ?? -1;
+                if (sb !== sa) return sb - sa;
+            } else if (effectiveSort === "usage_asc") {
+                const ma = a.parsedMeme?.usage?.messages ?? Number.MAX_SAFE_INTEGER;
+                const mb = b.parsedMeme?.usage?.messages ?? Number.MAX_SAFE_INTEGER;
+                if (ma !== mb) return ma - mb;
+                const sa = a.parsedMeme?.usage?.senders ?? Number.MAX_SAFE_INTEGER;
+                const sb = b.parsedMeme?.usage?.senders ?? Number.MAX_SAFE_INTEGER;
+                if (sa !== sb) return sa - sb;
+            }
+            return compareRecent(a, b);
+        });
+
+        const total = candidates.length;
+        const paged = candidates.slice(offset, offset + limit);
+
+        const participantIds: string[] = [];
+        if (kind === "meme") {
+            const seenUids = new Set<string>();
+            for (const c of paged) {
+                for (const uid of c.parsedMeme?.participants ?? []) {
+                    if (!seenUids.has(uid)) {
+                        seenUids.add(uid);
+                        participantIds.push(uid);
+                    }
+                }
+            }
+        }
+        const displayNames = participantIds.length > 0
+            ? resolveLatestChatDisplayNames(this.db, chatId, participantIds)
+            : new Map<string, string>();
+
+        const items = paged.map(c => this.formatDashboardFactItem({
+            chatId,
+            historyKey: c.historyKey,
+            kind,
+            status,
+            content: c.content,
+            sourceTopicLabel: c.sourceTopicLabel,
+            sourceMessageIds: c.sourceMessageIds,
+            observedAt: c.observedAt,
+            displayNames,
+        }));
+
+        return {
+            total,
+            counts: {
+                pending: pendingCount,
+                approved: approvedCount,
+                rejected: rejectedCount,
+            },
+            items,
+        };
+    }
+
+    reviewHistoryFacts(
+        chatId: string,
+        action: HistoryFactReviewAction,
+        historyKeys: readonly string[],
+    ): number {
+        const cleanChatId = chatId.trim();
+        if (!cleanChatId) return 0;
+        const uniqueKeys = [...new Set(historyKeys.map(k => k.trim()).filter(Boolean))];
+        if (uniqueKeys.length === 0) return 0;
+
+        const run = this.db.transaction((): number => {
+            const ts = nowIso();
+            let affected = 0;
+
+            if (action === "approve") {
+                const stmt = this.db.prepare(`
+                    UPDATE core_facts
+                    SET history_review = 'approved',
+                        updated_at = ?
+                    WHERE source_chat_id = ?
+                      AND history_key = ?
+                      AND history_key IS NOT NULL
+                `);
+                for (const key of uniqueKeys) {
+                    const res = stmt.run(ts, cleanChatId, key);
+                    affected += res.changes;
+                }
+                return affected;
+            }
+
+            if (action === "reset") {
+                const stmt = this.db.prepare(`
+                    UPDATE core_facts
+                    SET history_review = NULL,
+                        updated_at = ?
+                    WHERE source_chat_id = ?
+                      AND history_key = ?
+                      AND history_key IS NOT NULL
+                      AND history_review = 'approved'
+                `);
+                for (const key of uniqueKeys) {
+                    const res = stmt.run(ts, cleanChatId, key);
+                    affected += res.changes;
+                }
+                return affected;
+            }
+
+            if (action === "reject") {
+                const selectStmt = this.db.prepare(`
+                    SELECT rowid, id, subject, content, category, confidence, source,
+                           source_chat_id, source_chat_title, source_topic_id, source_topic_label,
+                           source_message_ids, source_interaction_ids, observed_at,
+                           visibility, sensitivity, history_key, created_at, updated_at, expires_at
+                    FROM core_facts
+                    WHERE source_chat_id = ?
+                      AND history_key = ?
+                      AND history_key IS NOT NULL
+                `);
+                const upsertTombstoneStmt = this.db.prepare(`
+                    INSERT INTO history_fact_rejections (
+                        chat_id, history_key, category, content, fact_json, rejected_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id, history_key) DO UPDATE SET
+                        category = excluded.category,
+                        content = excluded.content,
+                        fact_json = excluded.fact_json,
+                        rejected_at = excluded.rejected_at
+                `);
+                const deleteFtsStmt = this.db.prepare(`DELETE FROM core_facts_fts WHERE rowid = ?`);
+                const deleteVecStmt = this.isSqliteVecAvailable()
+                    ? this.db.prepare(`DELETE FROM facts_vec WHERE fact_id = ?`)
+                    : null;
+                const deleteFactStmt = this.db.prepare(`
+                    DELETE FROM core_facts
+                    WHERE id = ? AND source_chat_id = ? AND history_key IS NOT NULL
+                `);
+
+                for (const key of uniqueKeys) {
+                    const row = selectStmt.get(cleanChatId, key) as Record<string, unknown> | undefined;
+                    if (!row) continue;
+
+                    const snapshot = {
+                        id: row.id,
+                        subject: row.subject,
+                        content: row.content,
+                        category: row.category,
+                        confidence: row.confidence,
+                        source: row.source,
+                        source_chat_id: row.source_chat_id,
+                        source_chat_title: row.source_chat_title,
+                        source_topic_id: row.source_topic_id,
+                        source_topic_label: row.source_topic_label,
+                        source_message_ids: row.source_message_ids,
+                        source_interaction_ids: row.source_interaction_ids,
+                        observed_at: row.observed_at,
+                        visibility: row.visibility,
+                        sensitivity: row.sensitivity,
+                        history_key: row.history_key,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        expires_at: row.expires_at,
+                    };
+                    upsertTombstoneStmt.run(
+                        cleanChatId,
+                        key,
+                        String(row.category ?? "general"),
+                        String(row.content ?? ""),
+                        JSON.stringify(snapshot),
+                        ts,
+                    );
+                    deleteFtsStmt.run(row.rowid);
+                    if (deleteVecStmt) {
+                        deleteVecStmt.run(row.id);
+                    }
+                    const delRes = deleteFactStmt.run(row.id, cleanChatId);
+                    if (delRes.changes > 0) {
+                        affected++;
+                    }
+                }
+                return affected;
+            }
+
+            // action === "restore"
+            const selectTombstoneStmt = this.db.prepare(`
+                SELECT chat_id, history_key, category, content, fact_json
+                FROM history_fact_rejections
+                WHERE chat_id = ? AND history_key = ?
+            `);
+            const selectExistingFactStmt = this.db.prepare(`
+                SELECT id FROM core_facts WHERE source_chat_id = ? AND history_key = ?
+            `);
+            const selectFactByIdStmt = this.db.prepare(`
+                SELECT 1 FROM core_facts WHERE id = ?
+            `);
+            const insertFactStmt = this.db.prepare(`
+                INSERT INTO core_facts (
+                    id, subject, content, category, confidence, source,
+                    source_chat_id, source_chat_title, source_topic_id, source_topic_label,
+                    source_message_ids, source_interaction_ids, observed_at,
+                    visibility, sensitivity, history_key, history_review, embedding, created_at, updated_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', NULL, ?, ?, ?)
+            `);
+            const selectFtsRowStmt = this.db.prepare(`
+                SELECT rowid, content, subject FROM core_facts WHERE id = ?
+            `);
+            const deleteFtsStmt = this.db.prepare(`DELETE FROM core_facts_fts WHERE rowid = ?`);
+            const insertFtsStmt = this.db.prepare(`
+                INSERT INTO core_facts_fts(rowid, content, subject) VALUES (?, ?, ?)
+            `);
+            const deleteTombstoneStmt = this.db.prepare(`
+                DELETE FROM history_fact_rejections WHERE chat_id = ? AND history_key = ?
+            `);
+
+            for (const key of uniqueKeys) {
+                const tomb = selectTombstoneStmt.get(cleanChatId, key) as {
+                    chat_id: string;
+                    history_key: string;
+                    category: string;
+                    content: string;
+                    fact_json: string;
+                } | undefined;
+                if (!tomb) continue;
+
+                const existing = selectExistingFactStmt.get(cleanChatId, key) as { id: string } | undefined;
+                if (existing) {
+                    deleteTombstoneStmt.run(cleanChatId, key);
+                    affected++;
+                    continue;
+                }
+
+                const snap = parseJsonSafe<Record<string, unknown>>(tomb.fact_json, {});
+                const snapId = typeof snap.id === "string" && snap.id.trim() ? snap.id.trim() : "";
+                const factId = snapId && !selectFactByIdStmt.get(snapId) ? snapId : randomUUID();
+                const subject = typeof snap.subject === "string" && snap.subject.trim()
+                    ? snap.subject
+                    : `group:${cleanChatId}`;
+                const content = typeof snap.content === "string" ? snap.content : tomb.content;
+                const category = typeof snap.category === "string" && snap.category ? snap.category : tomb.category;
+                const confidence = typeof snap.confidence === "number" && Number.isFinite(snap.confidence)
+                    ? snap.confidence
+                    : 0.85;
+                const source = typeof snap.source === "string" ? snap.source : "offline_history";
+                const sourceChatTitle = typeof snap.source_chat_title === "string" ? snap.source_chat_title : cleanChatId;
+                const sourceTopicId = typeof snap.source_topic_id === "string" ? snap.source_topic_id : null;
+                const sourceTopicLabel = typeof snap.source_topic_label === "string" ? snap.source_topic_label : null;
+                const sourceMessageIds = typeof snap.source_message_ids === "string"
+                    ? snap.source_message_ids
+                    : JSON.stringify(Array.isArray(snap.source_message_ids) ? snap.source_message_ids : []);
+                const sourceInteractionIds = typeof snap.source_interaction_ids === "string"
+                    ? snap.source_interaction_ids
+                    : JSON.stringify(Array.isArray(snap.source_interaction_ids) ? snap.source_interaction_ids : []);
+                const observedAt = typeof snap.observed_at === "string" ? snap.observed_at : ts;
+                const visibility = typeof snap.visibility === "string" ? snap.visibility : "contextual";
+                const sensitivity = typeof snap.sensitivity === "string" ? snap.sensitivity : "low";
+                const createdAt = typeof snap.created_at === "string" && snap.created_at ? snap.created_at : ts;
+                const expiresAt = typeof snap.expires_at === "string" ? snap.expires_at : null;
+
+                insertFactStmt.run(
+                    factId,
+                    subject,
+                    content,
+                    category,
+                    confidence,
+                    source,
+                    cleanChatId,
+                    sourceChatTitle,
+                    sourceTopicId,
+                    sourceTopicLabel,
+                    sourceMessageIds,
+                    sourceInteractionIds,
+                    observedAt,
+                    visibility,
+                    sensitivity,
+                    key,
+                    createdAt,
+                    ts,
+                    expiresAt,
+                );
+
+                const ftsRow = selectFtsRowStmt.get(factId) as {
+                    rowid: number;
+                    content: string;
+                    subject: string;
+                } | undefined;
+                if (!ftsRow) {
+                    throw new Error(`Fact row missing for FTS sync during restore: ${factId}`);
+                }
+                deleteFtsStmt.run(ftsRow.rowid);
+                insertFtsStmt.run(ftsRow.rowid, ftsRow.content, ftsRow.subject);
+
+                deleteTombstoneStmt.run(cleanChatId, key);
+                affected++;
+            }
+            return affected;
+        });
+
+        return run();
+    }
+
+    editHistoryFact(input: EditHistoryFactInput): EditHistoryFactResult {
+        const cleanChatId = input.chatId.trim();
+        const cleanKey = input.historyKey.trim();
+        if (!cleanChatId || !cleanKey) {
+            return { status: "invalid", error: "chatId and historyKey are required" };
+        }
+
+        const run = this.db.transaction((): EditHistoryFactResult => {
+            const existing = this.db.prepare(`
+                SELECT rowid, id, subject, content, category, source_topic_label, source_message_ids, observed_at, created_at
+                FROM core_facts
+                WHERE source_chat_id = ?
+                  AND history_key = ?
+                  AND history_key IS NOT NULL
+            `).get(cleanChatId, cleanKey) as {
+                rowid: number;
+                id: string;
+                subject: string;
+                content: string;
+                category: string;
+                source_topic_label: string | null;
+                source_message_ids: string | null;
+                observed_at: string | null;
+                created_at: string;
+            } | undefined;
+
+            if (!existing) {
+                return { status: "not_found" };
+            }
+
+            let newContent: string;
+            let kind: HistoryFactKind;
+
+            if (existing.category === "anecdote") {
+                kind = "meme";
+                const meme = input.meme;
+                if (!meme || typeof meme !== "object") {
+                    return { status: "invalid", error: "meme object is required for anecdote facts" };
+                }
+                const term = typeof meme.term === "string" ? meme.term.trim() : "";
+                const meaning = typeof meme.meaning === "string" ? meme.meaning.trim() : "";
+                const usageBoundaries = typeof meme.usageBoundaries === "string" ? meme.usageBoundaries.trim() : "";
+                const originContext = typeof meme.originContext === "string" ? meme.originContext.trim() : "";
+                if (!term || !meaning || !usageBoundaries) {
+                    return { status: "invalid", error: "meme.term, meme.meaning, and meme.usageBoundaries are required" };
+                }
+                const existingParsed = parseMemeFactContent(existing.content);
+                newContent = buildMemeFactContent({
+                    term,
+                    meaning,
+                    originContext,
+                    participants: existingParsed.participants,
+                    usageBoundaries,
+                    usage: existingParsed.usage,
+                });
+            } else if (existing.category === "general") {
+                kind = "observation";
+                const content = typeof input.content === "string" ? input.content.trim() : "";
+                if (!content) {
+                    return { status: "invalid", error: "content is required for observation facts" };
+                }
+                newContent = content;
+            } else {
+                return { status: "invalid", error: `Unsupported history fact category: ${existing.category}` };
+            }
+
+            const ts = nowIso();
+            const contentChanged = existing.content !== newContent;
+            this.db.prepare(`
+                UPDATE core_facts
+                SET content = ?,
+                    history_review = 'approved',
+                    embedding = CASE WHEN ? = 1 THEN NULL ELSE embedding END,
+                    updated_at = ?
+                WHERE id = ? AND source_chat_id = ? AND history_key IS NOT NULL
+            `).run(newContent, contentChanged ? 1 : 0, ts, existing.id, cleanChatId);
+
+            if (contentChanged && this.isSqliteVecAvailable()) {
+                this.db.prepare(`DELETE FROM facts_vec WHERE fact_id = ?`).run(existing.id);
+            }
+
+            this.db.prepare(`DELETE FROM core_facts_fts WHERE rowid = ?`).run(existing.rowid);
+            this.db.prepare(`INSERT INTO core_facts_fts(rowid, content, subject) VALUES (?, ?, ?)`)
+                .run(existing.rowid, newContent, existing.subject);
+
+            const parsedForDisplay = kind === "meme" ? parseMemeFactContent(newContent) : null;
+            const displayNames = parsedForDisplay && parsedForDisplay.participants.length > 0
+                ? resolveLatestChatDisplayNames(this.db, cleanChatId, parsedForDisplay.participants)
+                : new Map<string, string>();
+
+            return {
+                status: "ok",
+                item: this.formatDashboardFactItem({
+                    chatId: cleanChatId,
+                    historyKey: cleanKey,
+                    kind,
+                    status: "approved",
+                    content: newContent,
+                    sourceTopicLabel: existing.source_topic_label?.trim() ? existing.source_topic_label : null,
+                    sourceMessageIds: parseJsonSafe<string[]>(existing.source_message_ids, []),
+                    observedAt: existing.observed_at || existing.created_at,
+                    displayNames,
+                }),
+            };
+        });
+
+        return run();
+    }
+
+    getHistoryFactEvidence(chatId: string, historyKey: string): HistoryFactEvidenceResult | null {
+        const cleanChatId = chatId.trim();
+        const cleanKey = historyKey.trim();
+        if (!cleanChatId || !cleanKey) return null;
+
+        let sourceTopicId: string | null = null;
+        let sourceMessageIds: string[] = [];
+
+        const liveRow = this.db.prepare(`
+            SELECT source_topic_id, source_message_ids
+            FROM core_facts
+            WHERE source_chat_id = ? AND history_key = ? AND history_key IS NOT NULL
+            LIMIT 1
+        `).get(cleanChatId, cleanKey) as {
+            source_topic_id: string | null;
+            source_message_ids: string | null;
+        } | undefined;
+
+        if (liveRow) {
+            sourceTopicId = liveRow.source_topic_id;
+            sourceMessageIds = parseJsonSafe<string[]>(liveRow.source_message_ids, []);
+        } else {
+            const tombRow = this.db.prepare(`
+                SELECT fact_json
+                FROM history_fact_rejections
+                WHERE chat_id = ? AND history_key = ?
+                LIMIT 1
+            `).get(cleanChatId, cleanKey) as { fact_json: string } | undefined;
+            if (!tombRow) {
+                return null;
+            }
+            const snap = parseJsonSafe<Record<string, unknown>>(tombRow.fact_json, {});
+            sourceTopicId = typeof snap.source_topic_id === "string" && snap.source_topic_id.trim()
+                ? snap.source_topic_id
+                : null;
+            if (typeof snap.source_message_ids === "string") {
+                sourceMessageIds = parseJsonSafe<string[]>(snap.source_message_ids, []);
+            } else if (Array.isArray(snap.source_message_ids)) {
+                sourceMessageIds = snap.source_message_ids.map(String);
+            }
+        }
+
+        let topic: { id: string; label: string; summary: string } | null = null;
+        if (sourceTopicId) {
+            const topicRow = this.db.prepare(`
+                SELECT id, label, summary
+                FROM topics
+                WHERE id = ? AND chat_id = ?
+                LIMIT 1
+            `).get(sourceTopicId, cleanChatId) as { id: string; label: string; summary: string } | undefined;
+            if (topicRow) {
+                topic = {
+                    id: topicRow.id,
+                    label: topicRow.label,
+                    summary: topicRow.summary,
+                };
+            }
+        }
+
+        const uniqueIds: string[] = [];
+        const seenIds = new Set<string>();
+        for (const rawId of sourceMessageIds) {
+            const id = typeof rawId === "string" ? rawId.trim() : "";
+            if (!id || seenIds.has(id)) continue;
+            seenIds.add(id);
+            uniqueIds.push(id);
+        }
+
+        if (uniqueIds.length === 0) {
+            return { topic, messages: [], missing: 0 };
+        }
+
+        const CHUNK = 200;
+        const foundById = new Map<string, {
+            messageId: string;
+            userId: string;
+            displayName: string;
+            timestamp: string;
+            text: string;
+        }>();
+
+        for (let i = 0; i < uniqueIds.length; i += CHUNK) {
+            const chunk = uniqueIds.slice(i, i + CHUNK);
+            const placeholders = chunk.map(() => "?").join(", ");
+            const rows = this.db.prepare(`
+                SELECT message_id, user_id, display_name, timestamp, text
+                FROM message_log
+                WHERE chat_id = ?
+                  AND access_control_blocked = 0
+                  AND message_id IN (${placeholders})
+            `).all(cleanChatId, ...chunk) as Array<{
+                message_id: string;
+                user_id: string;
+                display_name: string;
+                timestamp: string;
+                text: string;
+            }>;
+
+            for (const row of rows) {
+                foundById.set(row.message_id, {
+                    messageId: row.message_id,
+                    userId: row.user_id,
+                    displayName: row.display_name ?? "",
+                    timestamp: row.timestamp,
+                    text: row.text ?? "",
+                });
+            }
+        }
+
+        const userIds = [...new Set([...foundById.values()].map(m => m.userId).filter(Boolean))];
+        const chatDisplayNames = userIds.length > 0
+            ? resolveLatestChatDisplayNames(this.db, cleanChatId, userIds)
+            : new Map<string, string>();
+
+        const messages: HistoryFactEvidenceResult["messages"] = [];
+        for (const id of uniqueIds) {
+            const msg = foundById.get(id);
+            if (!msg) continue;
+            messages.push({
+                messageId: msg.messageId,
+                userId: msg.userId,
+                displayName: chatDisplayNames.get(msg.userId)?.trim() || msg.displayName.trim() || getRawId(msg.userId),
+                timestamp: msg.timestamp,
+                text: msg.text,
+            });
+        }
+
+        messages.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.messageId.localeCompare(b.messageId));
+
+        return {
+            topic,
+            messages,
+            missing: uniqueIds.length - messages.length,
+        };
+    }
+
+    getHistoryOverviewChats(activeRunnerChatId: string | null): HistoryOverviewChatRecord[] {
+        const chatRows = this.db.prepare(`
+            SELECT chat_id FROM (
+                SELECT DISTINCT chat_id FROM message_log WHERE origin = 'qce'
+                UNION
+                SELECT DISTINCT chat_id FROM history_jobs
+                UNION
+                SELECT DISTINCT source_chat_id AS chat_id FROM core_facts WHERE history_key IS NOT NULL AND source_chat_id IS NOT NULL
+                UNION
+                SELECT DISTINCT chat_id FROM history_fact_rejections
+            )
+            WHERE chat_id IS NOT NULL AND chat_id != ''
+        `).all() as Array<{ chat_id: string }>;
+
+        const nowMs = Date.now();
+        const selectTitleStmt = this.db.prepare(`SELECT chat_title FROM group_models WHERE chat_id = ?`);
+        const selectImportedStmt = this.db.prepare(`
+            SELECT COUNT(*) AS cnt FROM message_log WHERE chat_id = ? AND origin = 'qce'
+        `);
+        const selectEligibleStmt = this.db.prepare(`
+            SELECT
+                COUNT(*) AS cnt,
+                MIN(CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER)) AS min_ms,
+                MAX(CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER)) AS max_ms
+            FROM message_log
+            WHERE chat_id = ?
+              AND access_control_blocked = 0
+              AND user_id != ''
+              AND user_id != 'system'
+              AND timestamp != '1970-01-01T00:00:00.000Z'
+              AND CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER) > 86400000
+              AND (
+                qce_meta IS NULL
+                OR NOT json_valid(qce_meta)
+                OR (
+                  COALESCE(json_extract(qce_meta, '$.timeUnknown'), 0) != 1
+                  AND COALESCE(json_extract(qce_meta, '$.recalled'), 0) != 1
+                  AND COALESCE(json_extract(qce_meta, '$.system'), 0) != 1
+                )
+              )
+        `);
+        const selectCoveredStmt = this.db.prepare(`
+            SELECT COUNT(*) AS cnt FROM history_cluster_coverage WHERE chat_id = ?
+        `);
+        const selectTopicsStmt = this.db.prepare(`
+            SELECT COUNT(*) AS cnt FROM topics WHERE chat_id = ? AND history_key IS NOT NULL
+        `);
+        const selectFactCountsStmt = this.db.prepare(`
+            SELECT
+                category,
+                CASE WHEN history_review = 'approved' THEN 'approved' ELSE 'pending' END AS status,
+                COUNT(*) AS cnt
+            FROM core_facts
+            WHERE source_chat_id = ?
+              AND history_key IS NOT NULL
+              AND category IN ('anecdote', 'general')
+              AND (expires_at IS NULL OR expires_at > datetime('now'))
+            GROUP BY category, CASE WHEN history_review = 'approved' THEN 'approved' ELSE 'pending' END
+        `);
+        const selectRejectedCountsStmt = this.db.prepare(`
+            SELECT category, COUNT(*) AS cnt
+            FROM history_fact_rejections
+            WHERE chat_id = ? AND category IN ('anecdote', 'general')
+            GROUP BY category
+        `);
+        const selectImportJobsStmt = this.db.prepare(`
+            SELECT job_id, status, updated_at, input_key
+            FROM history_jobs
+            WHERE kind = 'qce_import' AND chat_id = ?
+            ORDER BY updated_at DESC, rowid DESC
+        `);
+        const selectLatestInitStmt = this.db.prepare(`
+            SELECT job_id, options_json, progress_json, status, updated_at
+            FROM history_jobs
+            WHERE kind = 'initialize' AND chat_id = ?
+            ORDER BY updated_at DESC, rowid DESC
+            LIMIT 1
+        `);
+        const selectUnitsSummaryStmt = this.db.prepare(`
+            SELECT
+                stage,
+                COUNT(*) AS total,
+                SUM(CASE WHEN completed_at IS NOT NULL THEN 1 ELSE 0 END) AS done,
+                MAX(completed_at) AS latest_completed_at
+            FROM history_units
+            WHERE job_id = ?
+            GROUP BY stage
+        `);
+        const selectLeaseStmt = this.db.prepare(`
+            SELECT expires_at_ms FROM history_leases WHERE chat_id = ?
+        `);
+
+        const results: Array<{ record: HistoryOverviewChatRecord; sortMs: number }> = [];
+
+        for (const { chat_id: chatId } of chatRows) {
+            const exactTitleRow = selectTitleStmt.get(chatId) as { chat_title: string } | undefined;
+            let chatTitle = exactTitleRow?.chat_title?.trim() ?? "";
+            if (!chatTitle) {
+                const groupKey = safeGroupModelKey(chatId);
+                if (groupKey !== chatId) {
+                    const baseRow = selectTitleStmt.get(groupKey) as { chat_title: string } | undefined;
+                    chatTitle = baseRow?.chat_title?.trim() ?? "";
+                }
+            }
+
+            const importedRow = selectImportedStmt.get(chatId) as { cnt: number } | undefined;
+            const eligibleRow = selectEligibleStmt.get(chatId) as {
+                cnt: number;
+                min_ms: number | null;
+                max_ms: number | null;
+            } | undefined;
+            const coveredRow = selectCoveredStmt.get(chatId) as { cnt: number } | undefined;
+            const topicsRow = selectTopicsStmt.get(chatId) as { cnt: number } | undefined;
+
+            const eligibleCount = Number(eligibleRow?.cnt ?? 0);
+            const earliest = eligibleCount > 0 && eligibleRow?.min_ms != null && Number.isFinite(eligibleRow.min_ms)
+                ? new Date(eligibleRow.min_ms).toISOString()
+                : null;
+            const latest = eligibleCount > 0 && eligibleRow?.max_ms != null && Number.isFinite(eligibleRow.max_ms)
+                ? new Date(eligibleRow.max_ms).toISOString()
+                : null;
+
+            const facts = {
+                meme: { pending: 0, approved: 0, rejected: 0 },
+                observation: { pending: 0, approved: 0, rejected: 0 },
+            };
+            const factRows = selectFactCountsStmt.all(chatId) as Array<{
+                category: string;
+                status: "pending" | "approved";
+                cnt: number;
+            }>;
+            for (const fr of factRows) {
+                const target = fr.category === "anecdote" ? facts.meme : facts.observation;
+                target[fr.status] = Number(fr.cnt);
+            }
+            const rejRows = selectRejectedCountsStmt.all(chatId) as Array<{ category: string; cnt: number }>;
+            for (const rr of rejRows) {
+                const target = rr.category === "anecdote" ? facts.meme : facts.observation;
+                target.rejected = Number(rr.cnt);
+            }
+
+            const importRows = selectImportJobsStmt.all(chatId) as Array<{
+                job_id: string;
+                status: HistoryJobStatus;
+                updated_at: string;
+                input_key: string;
+            }>;
+            const importJobs = importRows.map(ir => ({
+                jobId: ir.job_id,
+                status: ir.status,
+                updatedAt: ir.updated_at,
+                inputKeyShort: ir.input_key.replace(/^qce:sha256:/, "").slice(0, 8),
+            }));
+
+            const initRow = selectLatestInitStmt.get(chatId) as {
+                job_id: string;
+                options_json: string;
+                progress_json: string;
+                status: HistoryJobStatus;
+                updated_at: string;
+            } | undefined;
+
+            let initJob: HistoryOverviewChatRecord["initJob"] = null;
+            if (initRow) {
+                const opts = parseJsonSafe<Record<string, unknown>>(initRow.options_json, {});
+                const mode: "quick" | "full" = opts.mode === "full" ? "full" : "quick";
+                const leaseRow = selectLeaseStmt.get(chatId) as { expires_at_ms: number } | undefined;
+                const leaseActive = Boolean(leaseRow && leaseRow.expires_at_ms > nowMs);
+                const isRunnerActive = activeRunnerChatId === chatId;
+
+                let status: "running" | "paused" | "done" | "stale";
+                if (initRow.status === "running") {
+                    status = (leaseActive || isRunnerActive) ? "running" : "stale";
+                } else if (initRow.status === "done") {
+                    status = "done";
+                } else {
+                    status = "paused";
+                }
+
+                const progressObj = parseJsonSafe<Record<string, unknown>>(initRow.progress_json, {});
+                const error = (status === "paused" || status === "stale")
+                    && typeof progressObj.error === "string"
+                    && progressObj.error.trim()
+                    ? progressObj.error
+                    : null;
+
+                const stages = {
+                    cluster: { done: 0, total: 0 },
+                    synthesize: { done: 0, total: 0 },
+                    embed: { done: 0, total: 0 },
+                };
+                const unitRows = selectUnitsSummaryStmt.all(initRow.job_id) as Array<{
+                    stage: HistoryUnitStage;
+                    total: number;
+                    done: number;
+                    latest_completed_at: string | null;
+                }>;
+                let latestUpdatedAt = initRow.updated_at;
+                let latestUpdatedMs = Date.parse(initRow.updated_at);
+                for (const ur of unitRows) {
+                    if (ur.stage === "cluster" || ur.stage === "synthesize" || ur.stage === "embed") {
+                        stages[ur.stage] = {
+                            done: Number(ur.done ?? 0),
+                            total: Number(ur.total ?? 0),
+                        };
+                    }
+                    if (ur.latest_completed_at) {
+                        const ms = Date.parse(ur.latest_completed_at);
+                        if (
+                            (Number.isFinite(ms) && (!Number.isFinite(latestUpdatedMs) || ms > latestUpdatedMs))
+                            || (!Number.isFinite(ms) && !Number.isFinite(latestUpdatedMs) && ur.latest_completed_at > latestUpdatedAt)
+                        ) {
+                            latestUpdatedAt = ur.latest_completed_at;
+                            latestUpdatedMs = ms;
+                        }
+                    }
+                }
+
+                initJob = {
+                    jobId: initRow.job_id,
+                    mode,
+                    status,
+                    updatedAt: latestUpdatedAt,
+                    error,
+                    stages,
+                    resumable: status === "paused" || status === "stale",
+                };
+            }
+
+            const sortCandidates = [
+                initJob ? Date.parse(initJob.updatedAt) : 0,
+                importJobs[0] ? Date.parse(importJobs[0].updatedAt) : 0,
+                eligibleRow?.max_ms ?? 0,
+            ].filter(n => Number.isFinite(n));
+            const sortMs = sortCandidates.length > 0 ? Math.max(...sortCandidates) : 0;
+
+            results.push({
+                record: {
+                    chatId,
+                    chatTitle,
+                    messages: {
+                        imported: Number(importedRow?.cnt ?? 0),
+                        eligible: eligibleCount,
+                        covered: Number(coveredRow?.cnt ?? 0),
+                        earliest,
+                        latest,
+                    },
+                    topics: Number(topicsRow?.cnt ?? 0),
+                    facts,
+                    importJobs,
+                    initJob,
+                },
+                sortMs,
+            });
+        }
+
+        results.sort((a, b) => (b.sortMs - a.sortMs) || a.record.chatId.localeCompare(b.record.chatId));
+        return results.map(r => r.record);
     }
 }
 

@@ -15,6 +15,7 @@ import { createLogger } from "../core/logger.js";
 import { loadPromptFile } from "../core/prompt-loader.js";
 import { getGlobalTimezone } from "../core/timezone.js";
 import { embed } from "../memory-v2/embedding.js";
+import { buildMemeFactContent } from "../memory-v2/meme-format.js";
 import {
     MAX_GROUP_HOT_TOPICS_SEED_ITEMS,
     MAX_GROUP_NORMS_SEED_ITEMS,
@@ -24,12 +25,14 @@ import {
     MIN_MEME_RECURRENCE_VARIANT_CHARS,
     NEWCOMER_AGENT_ROLE,
     computeEmbeddingContentHash,
+    computeMessagesDigest,
     type HistorySynthesisCitation,
     type HistorySynthesisEpisodeInput,
     type HistorySynthesisFactProposal,
     type HistorySynthesisGroupPatch,
     type HistorySynthesisMemberPatch,
     type HistoryUnitInput,
+    type HistoryUnitRecord,
 } from "../memory-v2/history-store.js";
 import {
     MEME_VARIANT_SPLIT_RE,
@@ -48,15 +51,18 @@ import { dryRunQceImport, importQce, type QceImportOptions, type QceImportSummar
 import { openSqliteReadOnlyStrict } from "./sqlite-readonly.js";
 import { assertValidIanaTimezone, parseStrictTimestampMs } from "./time-utils.js";
 import {
+    DEFAULT_MAX_SAMPLE_MESSAGES_PER_TOPIC,
     DEFAULT_MAX_TOPICS_PER_BATCH,
     DEFAULT_MIN_WINDOW_MESSAGES,
     buildHistoryWindows,
     buildSynthesisMacroBatches,
     buildSynthesisTopicBlock,
     getHistoryMessageEvidenceText,
+    getUtcIsoWeekKey,
     isEligibleHistoryMessageRow,
     loadEligibleHistoryMessages,
     selectWindowsForMode,
+    toDigestFields,
     type HistoryMessageRow,
     type HistoryWindow,
     type SkippedPartialTopic,
@@ -152,6 +158,7 @@ const SYNTHESIS_SAMPLE_STEPS = [12, 6, 3] as const;
 const MAX_RATE_LIMIT_BACKOFF_RETRIES = 2;
 const MAX_RETRY_AFTER_MS = 30_000;
 const DEFAULT_LEASE_TTL_MS = 60_000;
+export const ESTIMATED_MESSAGES_PER_TOPIC = 10.5;
 
 const FALLBACK_CLUSTER_PROMPT = `你是一个离线历史聊天话题聚类助手。将按时间顺序排列的历史群聊消息切分为连贯的话题段落。
 只使用输入中提供的 messageIds，每条消息最多归属一个话题，绝不编造不存在的 ID。
@@ -180,7 +187,8 @@ function createAbortError(): Error {
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
     if (ms <= 0) return Promise.resolve();
-    if (signal?.aborted) return Promise.reject(createAbortError());
+    const getAbortErr = () => (signal?.reason instanceof Error ? signal.reason : createAbortError());
+    if (signal?.aborted) return Promise.reject(getAbortErr());
     return new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
             signal?.removeEventListener("abort", onAbort);
@@ -188,7 +196,7 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
         }, ms);
         const onAbort = () => {
             clearTimeout(timer);
-            reject(createAbortError());
+            reject(getAbortErr());
         };
         signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -618,6 +626,62 @@ function validateSynthesisResponse(obj: Record<string, unknown>): ValidatedSynth
 
 // ─── Read-only Dry-Run Inspection (zero DB creation/mutation) ───
 
+export function estimateSynthesisUnitsCount(params: {
+    runClusterStage: boolean;
+    runSynthesizeStage: boolean;
+    plannedWindows: readonly HistoryWindow[];
+    existingTopicsByWeek: ReadonlyMap<string, number>;
+    pendingExistingSynthUnitsByWeek: ReadonlyMap<string, number>;
+    pendingExistingSynthTotal: number;
+    maxWindows?: number;
+}): { totalUnits: number; plannedUnits: number } {
+    const {
+        runClusterStage,
+        runSynthesizeStage,
+        plannedWindows,
+        existingTopicsByWeek,
+        pendingExistingSynthUnitsByWeek,
+        pendingExistingSynthTotal,
+        maxWindows,
+    } = params;
+
+    if (!runSynthesizeStage) {
+        return { totalUnits: 0, plannedUnits: 0 };
+    }
+
+    let totalUnits = 0;
+    if (!runClusterStage || plannedWindows.length === 0) {
+        totalUnits = pendingExistingSynthTotal;
+    } else {
+        const newTopicsByWeek = new Map<string, number>();
+        for (const win of plannedWindows) {
+            const week = getUtcIsoWeekKey(win.startedAt);
+            const estTopics = Math.max(1, Math.round(win.messages.length / ESTIMATED_MESSAGES_PER_TOPIC));
+            newTopicsByWeek.set(week, (newTopicsByWeek.get(week) ?? 0) + estTopics);
+        }
+
+        const allWeeks = new Set<string>([
+            ...existingTopicsByWeek.keys(),
+            ...newTopicsByWeek.keys(),
+            ...pendingExistingSynthUnitsByWeek.keys(),
+        ]);
+        for (const week of allWeeks) {
+            const newTopics = newTopicsByWeek.get(week) ?? 0;
+            if (newTopics === 0) {
+                totalUnits += pendingExistingSynthUnitsByWeek.get(week) ?? 0;
+            } else {
+                const totalTopics = (existingTopicsByWeek.get(week) ?? 0) + newTopics;
+                totalUnits += Math.max(1, Math.ceil(totalTopics / DEFAULT_MAX_TOPICS_PER_BATCH));
+            }
+        }
+    }
+
+    const plannedUnits = maxWindows !== undefined
+        ? Math.min(totalUnits, maxWindows)
+        : totalUnits;
+    return { totalUnits, plannedUnits };
+}
+
 function inspectHistoryDryRunReadOnly(params: {
     dbPath: string;
     chatId: string;
@@ -660,7 +724,8 @@ function inspectHistoryDryRunReadOnly(params: {
 
     let dbMessages: HistoryMessageRow[] = [];
     const coveredIds = new Set<string>();
-    let storedTopicCount = 0;
+    const existingTopicsByWeek = new Map<string, number>();
+    const completedSynthByWeek = new Map<string, number>();
     let isPrivateOrSensitive = isPlatformDirectMessageChatId(chatId)
         || isSensitiveConfigSeed(chatId, config)
         || Boolean(importSummary?.isDirectMessage);
@@ -707,11 +772,39 @@ function inspectHistoryDryRunReadOnly(params: {
 
             if (tables.has("topics")) {
                 const topicCols = getCols("topics");
-                if (topicCols.has("history_key")) {
-                    const cntRow = roDb.prepare(
-                        "SELECT COUNT(*) as cnt FROM topics WHERE chat_id = ? AND history_key IS NOT NULL",
-                    ).get(chatId) as { cnt: number } | undefined;
-                    storedTopicCount = Number(cntRow?.cnt ?? 0);
+                if (topicCols.has("history_key") && topicCols.has("started_at")) {
+                    const topicRows = roDb.prepare(
+                        "SELECT started_at FROM topics WHERE chat_id = ? AND history_key IS NOT NULL",
+                    ).all(chatId) as Array<{ started_at: string }>;
+                    for (const r of topicRows) {
+                        const week = getUtcIsoWeekKey(r.started_at);
+                        existingTopicsByWeek.set(week, (existingTopicsByWeek.get(week) ?? 0) + 1);
+                    }
+                }
+            }
+
+            if (tables.has("history_units") && tables.has("history_jobs")) {
+                const unitRows = roDb.prepare(`
+                    SELECT DISTINCT hu.unit_key, hu.input_json
+                    FROM history_units hu
+                    INNER JOIN history_jobs hj ON hj.job_id = hu.job_id
+                    WHERE hj.kind = 'initialize'
+                      AND hj.chat_id = ?
+                      AND hu.stage = 'synthesize'
+                      AND hu.completed_at IS NOT NULL
+                `).all(chatId) as Array<{ unit_key: string; input_json: string }>;
+                for (const r of unitRows) {
+                    try {
+                        const parsed = JSON.parse(r.input_json) as { isoWeek?: unknown };
+                        if (typeof parsed?.isoWeek === "string" && parsed.isoWeek) {
+                            completedSynthByWeek.set(
+                                parsed.isoWeek,
+                                (completedSynthByWeek.get(parsed.isoWeek) ?? 0) + 1,
+                            );
+                        }
+                    } catch {
+                        // ignore
+                    }
                 }
             }
 
@@ -829,17 +922,26 @@ function inspectHistoryDryRunReadOnly(params: {
     const plannedClusterUnits = maxWins !== undefined ? Math.min(selectedWindows.length, maxWins) : selectedWindows.length;
     const estimatedClusterCalls = runClusterStage ? plannedClusterUnits * 2 : 0;
 
-    let estimatedSynthesisUnits = 0;
-    if (runSynthesizeStage) {
-        if (storedTopicCount > 0) {
-            estimatedSynthesisUnits = Math.max(1, Math.ceil(storedTopicCount / DEFAULT_MAX_TOPICS_PER_BATCH));
-        } else if (runClusterStage && plannedClusterUnits > 0) {
-            estimatedSynthesisUnits = Math.max(1, Math.ceil(plannedClusterUnits / 6));
+    const pendingExistingSynthUnitsByWeek = new Map<string, number>();
+    let pendingExistingSynthTotal = 0;
+    for (const [week, topicCount] of existingTopicsByWeek.entries()) {
+        const batchesInWeek = Math.max(1, Math.ceil(topicCount / DEFAULT_MAX_TOPICS_PER_BATCH));
+        const completedInWeek = completedSynthByWeek.get(week) ?? 0;
+        const pendingInWeek = Math.max(0, batchesInWeek - completedInWeek);
+        if (pendingInWeek > 0) {
+            pendingExistingSynthUnitsByWeek.set(week, pendingInWeek);
+            pendingExistingSynthTotal += pendingInWeek;
         }
     }
-    const plannedSynthesisUnits = maxWins !== undefined
-        ? Math.min(estimatedSynthesisUnits, maxWins)
-        : estimatedSynthesisUnits;
+    const synthEstimate = estimateSynthesisUnitsCount({
+        runClusterStage,
+        runSynthesizeStage,
+        plannedWindows: selectedWindows.slice(0, plannedClusterUnits),
+        existingTopicsByWeek,
+        pendingExistingSynthUnitsByWeek,
+        pendingExistingSynthTotal,
+        maxWindows: maxWins,
+    });
 
     return {
         dryRun: true,
@@ -857,7 +959,7 @@ function inspectHistoryDryRunReadOnly(params: {
         topicsCommitted: 0,
         messagesCovered: 0,
         processedSynthesisUnits: 0,
-        remainingSynthesisUnits: Math.max(0, estimatedSynthesisUnits - plannedSynthesisUnits),
+        remainingSynthesisUnits: Math.max(0, synthEstimate.totalUnits - synthEstimate.plannedUnits),
         factsCommitted: 0,
         membersUpdated: 0,
         groupFieldsWritten: [],
@@ -865,7 +967,7 @@ function inspectHistoryDryRunReadOnly(params: {
         embeddedTopics: 0,
         embeddedFacts: 0,
         estimatedClusterCalls,
-        estimatedSynthesisCalls: plannedSynthesisUnits,
+        estimatedSynthesisCalls: synthEstimate.plannedUnits,
         warnings,
     };
 }
@@ -1024,9 +1126,16 @@ export async function runHistoryInitializationWithMemory(
     }
 
     // Strict --profile validation BEFORE any DB/LLM work
-    const clusterRouting = stage === "import" ? undefined : resolveStrictProfiles(options.profile, "recording_cluster", config);
-    const summaryRouting = stage === "import" ? undefined : resolveStrictProfiles(options.profile, "recording_triage", config);
-    const synthesisRouting = stage === "import" ? undefined : resolveStrictProfiles(options.profile, "reflection", config);
+    const skipProfileCheckForInProcessDryRun = Boolean(options.dryRun && options.profile === undefined);
+    const clusterRouting = stage === "import" || skipProfileCheckForInProcessDryRun
+        ? undefined
+        : resolveStrictProfiles(options.profile, "recording_cluster", config);
+    const summaryRouting = stage === "import" || skipProfileCheckForInProcessDryRun
+        ? undefined
+        : resolveStrictProfiles(options.profile, "recording_triage", config);
+    const synthesisRouting = stage === "import" || skipProfileCheckForInProcessDryRun
+        ? undefined
+        : resolveStrictProfiles(options.profile, "reflection", config);
 
     let importSummary: QceImportSummary | undefined = precomputedDryRunImport;
     let chatId = options.chatId?.trim() || "";
@@ -1127,17 +1236,39 @@ export async function runHistoryInitializationWithMemory(
             })
             : { batches: [], skippedPartialTopics: [] };
 
+        const existingTopicsByWeek = new Map<string, number>();
+        for (const t of storedTopics) {
+            const week = getUtcIsoWeekKey(t.startedAt);
+            existingTopicsByWeek.set(week, (existingTopicsByWeek.get(week) ?? 0) + 1);
+        }
+        const completedSynthKeys = runSynthesizeStage
+            ? memory.listCompletedHistoryUnitKeys(chatId, "initialize", "synthesize")
+            : new Set<string>();
+        const pendingExistingSynthUnitsByWeek = new Map<string, number>();
+        let pendingExistingSynthTotal = 0;
+        for (const b of existingSynthPlan.batches) {
+            if (completedSynthKeys.has(b.unitKey)) continue;
+            pendingExistingSynthUnitsByWeek.set(
+                b.isoWeek,
+                (pendingExistingSynthUnitsByWeek.get(b.isoWeek) ?? 0) + 1,
+            );
+            pendingExistingSynthTotal++;
+        }
+
         const plannedClusterUnits = maxWindows !== undefined
             ? Math.min(selectedWindows.length, maxWindows)
             : selectedWindows.length;
         const estimatedClusterCalls = plannedClusterUnits * 2;
 
-        const baseSynthCount = existingSynthPlan.batches.length > 0
-            ? existingSynthPlan.batches.length
-            : (runClusterStage && plannedClusterUnits > 0 ? Math.max(1, Math.ceil(plannedClusterUnits / 6)) : 0);
-        const plannedSynthUnits = maxWindows !== undefined
-            ? Math.min(baseSynthCount, maxWindows)
-            : baseSynthCount;
+        const synthEstimate = estimateSynthesisUnitsCount({
+            runClusterStage,
+            runSynthesizeStage,
+            plannedWindows: selectedWindows.slice(0, plannedClusterUnits),
+            existingTopicsByWeek,
+            pendingExistingSynthUnitsByWeek,
+            pendingExistingSynthTotal,
+            maxWindows,
+        });
 
         return {
             dryRun: true,
@@ -1155,7 +1286,7 @@ export async function runHistoryInitializationWithMemory(
             topicsCommitted: 0,
             messagesCovered: 0,
             processedSynthesisUnits: 0,
-            remainingSynthesisUnits: Math.max(0, existingSynthPlan.batches.length - plannedSynthUnits),
+            remainingSynthesisUnits: Math.max(0, synthEstimate.totalUnits - synthEstimate.plannedUnits),
             factsCommitted: 0,
             membersUpdated: 0,
             groupFieldsWritten: [],
@@ -1163,7 +1294,7 @@ export async function runHistoryInitializationWithMemory(
             embeddedTopics: 0,
             embeddedFacts: 0,
             estimatedClusterCalls,
-            estimatedSynthesisCalls: runSynthesizeStage ? plannedSynthUnits : 0,
+            estimatedSynthesisCalls: synthEstimate.plannedUnits,
             warnings,
         };
     }
@@ -1239,6 +1370,7 @@ export async function runHistoryInitializationWithMemory(
     let jobIdForCleanup = "";
     try {
         const existingJob = memory.findLatestHistoryJob("initialize", chatId);
+        let prevResumeMode: HistoryInitMode | undefined;
         if (options.resume) {
             if (!existingJob) {
                 throw new Error(`No previous initialize job found to resume for chat ${chatId}. Run without --resume.`);
@@ -1250,6 +1382,7 @@ export async function runHistoryInitializationWithMemory(
                 throw new Error(`Corrupt initialize job optionsJson for chat ${chatId}; cannot --resume.`);
             }
             const prevMode = prevOpts.mode as HistoryInitMode | undefined;
+            prevResumeMode = prevMode;
             const modeCompatible = prevMode === mode || (prevMode === "quick" && mode === "full");
             const scopeMatches =
                 (prevOpts.stage ?? null) === scopeFingerprint.stage
@@ -1276,6 +1409,15 @@ export async function runHistoryInitializationWithMemory(
         }, lease.ownerToken);
         jobIdForCleanup = job.jobId;
 
+        const isSameModeResume = Boolean(options.resume && prevResumeMode === mode);
+        const existingClusterUnits = isSameModeResume ? memory.listHistoryUnits(job.jobId, "cluster") : [];
+        const existingSynthUnits = isSameModeResume ? memory.listHistoryUnits(job.jobId, "synthesize") : [];
+        const existingEmbedUnits = isSameModeResume ? memory.listHistoryUnits(job.jobId, "embed") : [];
+        const hasPendingExistingUnits =
+            existingClusterUnits.some(u => u.completedAt === null)
+            || existingSynthUnits.some(u => u.completedAt === null)
+            || existingEmbedUnits.some(u => u.completedAt === null);
+
         const eligibleMessages = loadEligibleHistoryMessages(memory, chatId, {
             since: options.since,
             until: options.until,
@@ -1284,9 +1426,62 @@ export async function runHistoryInitializationWithMemory(
         const allWindows = buildHistoryWindows(eligibleMessages, windowConfig);
         const coveredIds = memory.getCoveredMessageIds(chatId);
         const uncoveredWindows = allWindows.filter(w => w.messages.some(m => !coveredIds.has(m.messageId)));
-        const selectedWindows = runClusterStage
-            ? selectWindowsForMode(allWindows, mode, coveredIds, windowConfig)
-            : [];
+
+        let pendingWindows: HistoryWindow[] = [];
+        let selectedWindowsCount = 0;
+
+        if (runClusterStage) {
+            if (isSameModeResume && existingClusterUnits.length > 0) {
+                const pendingUnits = existingClusterUnits.filter(u => u.completedAt === null);
+                if (pendingUnits.length === 0) {
+                    pendingWindows = [];
+                    selectedWindowsCount = existingClusterUnits.length;
+                } else {
+                    const reconstructed = reconstructPendingClusterWindows(pendingUnits, eligibleMessages);
+                    if (reconstructed) {
+                        pendingWindows = reconstructed;
+                        selectedWindowsCount = existingClusterUnits.length;
+                    } else {
+                        const freshSelected = selectWindowsForMode(allWindows, mode, coveredIds, windowConfig);
+                        const clusterUnitInputs: HistoryUnitInput[] = freshSelected.map((w, idx) => ({
+                            unitKey: w.unitKey,
+                            ordinal: idx,
+                            inputJson: JSON.stringify({
+                                messageIds: w.messageIds,
+                                startedAt: w.startedAt,
+                                endedAt: w.endedAt,
+                                inputDigest: w.inputDigest,
+                            }),
+                        }));
+                        memory.upsertHistoryUnits(job.jobId, "cluster", clusterUnitInputs, lease.ownerToken);
+                        const storedUnits = memory.listHistoryUnits(job.jobId, "cluster");
+                        const completedKeys = new Set(storedUnits.filter(u => u.completedAt !== null).map(u => u.unitKey));
+                        pendingWindows = freshSelected.filter(w => !completedKeys.has(w.unitKey));
+                        selectedWindowsCount = freshSelected.length;
+                    }
+                }
+            } else if (isSameModeResume && hasPendingExistingUnits) {
+                pendingWindows = [];
+                selectedWindowsCount = 0;
+            } else {
+                const freshSelected = selectWindowsForMode(allWindows, mode, coveredIds, windowConfig);
+                const clusterUnitInputs: HistoryUnitInput[] = freshSelected.map((w, idx) => ({
+                    unitKey: w.unitKey,
+                    ordinal: idx,
+                    inputJson: JSON.stringify({
+                        messageIds: w.messageIds,
+                        startedAt: w.startedAt,
+                        endedAt: w.endedAt,
+                        inputDigest: w.inputDigest,
+                    }),
+                }));
+                memory.upsertHistoryUnits(job.jobId, "cluster", clusterUnitInputs, lease.ownerToken);
+                const storedUnits = memory.listHistoryUnits(job.jobId, "cluster");
+                const completedKeys = new Set(storedUnits.filter(u => u.completedAt !== null).map(u => u.unitKey));
+                pendingWindows = freshSelected.filter(w => !completedKeys.has(w.unitKey));
+                selectedWindowsCount = freshSelected.length;
+            }
+        }
 
         let processedClusterUnits = 0;
         let remainingClusterUnits = 0;
@@ -1305,21 +1500,6 @@ export async function runHistoryInitializationWithMemory(
         try {
             // ── Stage 1: Cluster + Summary ──
             if (runClusterStage) {
-                const clusterUnitInputs: HistoryUnitInput[] = selectedWindows.map((w, idx) => ({
-                    unitKey: w.unitKey,
-                    ordinal: idx,
-                    inputJson: JSON.stringify({
-                        messageIds: w.messageIds,
-                        startedAt: w.startedAt,
-                        endedAt: w.endedAt,
-                        inputDigest: w.inputDigest,
-                    }),
-                }));
-                memory.upsertHistoryUnits(job.jobId, "cluster", clusterUnitInputs, lease.ownerToken);
-                const storedUnits = memory.listHistoryUnits(job.jobId, "cluster");
-                const completedKeys = new Set(storedUnits.filter(u => u.completedAt !== null).map(u => u.unitKey));
-                const pendingWindows = selectedWindows.filter(w => !completedKeys.has(w.unitKey));
-
                 const toProcess = maxWindows !== undefined
                     ? pendingWindows.slice(0, maxWindows)
                     : pendingWindows;
@@ -1371,15 +1551,65 @@ export async function runHistoryInitializationWithMemory(
                 });
                 skippedPartialTopics = synthPlan.skippedPartialTopics;
 
-                const synthUnitInputs: HistoryUnitInput[] = synthPlan.batches.map((b, idx) => ({
-                    unitKey: b.unitKey,
-                    ordinal: idx,
-                    inputJson: b.inputJson,
-                }));
-                memory.upsertHistoryUnits(job.jobId, "synthesize", synthUnitInputs, lease.ownerToken);
-                const storedUnits = memory.listHistoryUnits(job.jobId, "synthesize");
-                const completedKeys = new Set(storedUnits.filter(u => u.completedAt !== null).map(u => u.unitKey));
-                const pendingBatches = synthPlan.batches.filter(b => !completedKeys.has(b.unitKey));
+                let pendingBatches: SynthesisMacroBatch[];
+                const hasExistingSynth = isSameModeResume && existingSynthUnits.length > 0;
+                const hasPendingEmbedOnly = isSameModeResume
+                    && existingSynthUnits.length === 0
+                    && existingEmbedUnits.some(u => u.completedAt === null);
+
+                if (hasExistingSynth) {
+                    const pendingSynthUnits = existingSynthUnits.filter(u => u.completedAt === null);
+                    if (pendingSynthUnits.length === 0) {
+                        pendingBatches = [];
+                    } else {
+                        const batchByKey = new Map(synthPlan.batches.map(b => [b.unitKey, b]));
+                        const reconstructed = reconstructPendingSynthesisBatches(
+                            pendingSynthUnits,
+                            batchByKey,
+                            historicalTopics,
+                            memory,
+                            chatId,
+                        );
+                        if (reconstructed) {
+                            pendingBatches = reconstructed;
+                        } else {
+                            const synthUnitInputs: HistoryUnitInput[] = synthPlan.batches.map((b, idx) => ({
+                                unitKey: b.unitKey,
+                                ordinal: idx,
+                                inputJson: b.inputJson,
+                            }));
+                            memory.upsertHistoryUnits(job.jobId, "synthesize", synthUnitInputs, lease.ownerToken);
+                            const storedUnits = memory.listHistoryUnits(job.jobId, "synthesize");
+                            const completedKeys = new Set(storedUnits.filter(u => u.completedAt !== null).map(u => u.unitKey));
+                            pendingBatches = synthPlan.batches.filter(b => !completedKeys.has(b.unitKey));
+                        }
+                    }
+                } else if (hasPendingEmbedOnly) {
+                    pendingBatches = [];
+                } else {
+                    const synthUnitInputs: HistoryUnitInput[] = synthPlan.batches.map((b, idx) => ({
+                        unitKey: b.unitKey,
+                        ordinal: idx,
+                        inputJson: b.inputJson,
+                    }));
+                    memory.upsertHistoryUnits(job.jobId, "synthesize", synthUnitInputs, lease.ownerToken);
+                    const storedUnits = memory.listHistoryUnits(job.jobId, "synthesize");
+                    const completedKeys = new Set(storedUnits.filter(u => u.completedAt !== null).map(u => u.unitKey));
+                    const crossJobCompletedKeys = memory.listCompletedHistoryUnitKeys(chatId, "initialize", "synthesize");
+                    for (const b of synthPlan.batches) {
+                        if (!completedKeys.has(b.unitKey) && crossJobCompletedKeys.has(b.unitKey)) {
+                            memory.markHistoryUnitCompleted(
+                                job.jobId,
+                                lease.ownerToken,
+                                "synthesize",
+                                b.unitKey,
+                                JSON.stringify({ reusedFromPreviousJob: true }),
+                            );
+                            completedKeys.add(b.unitKey);
+                        }
+                    }
+                    pendingBatches = synthPlan.batches.filter(b => !completedKeys.has(b.unitKey));
+                }
 
                 const toProcess = maxWindows !== undefined
                     ? pendingBatches.slice(0, maxWindows)
@@ -1471,7 +1701,7 @@ export async function runHistoryInitializationWithMemory(
                 eligibleMessages: eligibleMessages.length,
                 totalWindows: allWindows.length,
                 uncoveredWindows: uncoveredWindows.length,
-                selectedWindows: selectedWindows.length,
+                selectedWindows: selectedWindowsCount,
                 processedClusterUnits,
                 remainingClusterUnits,
                 topicsCommitted,
@@ -1491,8 +1721,11 @@ export async function runHistoryInitializationWithMemory(
         } catch (err) {
             if (jobIdForCleanup) {
                 try {
+                    const abortReasonMsg = (signal?.aborted && isAbortError(err) && signal.reason instanceof Error && signal.reason.message.trim())
+                        ? signal.reason.message.trim()
+                        : null;
                     memory.updateHistoryJobStatus(jobIdForCleanup, lease.ownerToken, "paused", {
-                        error: err instanceof Error ? err.message : String(err),
+                        error: abortReasonMsg ?? (err instanceof Error ? err.message : String(err)),
                         pausedAt: new Date().toISOString(),
                     });
                 } catch {
@@ -2511,6 +2744,10 @@ function groundSynthesisOutput(
     const factProposals: HistorySynthesisFactProposal[] = [];
     const seenFactHistoryKeys = new Set<string>();
     const knownMemeVariants = loadStoredNormalizedMemeVariants(memory, chatId);
+    const protection = memory.getSynthesisProtectionData(chatId);
+    for (const v of protection.rejectedMemeVariants) {
+        knownMemeVariants.add(v);
+    }
     let acceptedMemesCount = 0;
     let acceptedObsCount = 0;
     const groupSubject = `group:${chatId}`;
@@ -2566,26 +2803,35 @@ function groundSynthesisOutput(
             ? rec.canonicalKey.trim()
             : attestedTerm;
         const historyKey = `hist_meme:${createHash("sha256").update(`${chatId}\n${canonical}`).digest("hex").slice(0, 24)}`;
-        if (seenFactHistoryKeys.has(historyKey)) continue;
+        if (
+            seenFactHistoryKeys.has(historyKey)
+            || protection.rejectedKeys.has(historyKey)
+            || protection.approvedKeys.has(historyKey)
+        ) {
+            continue;
+        }
         seenFactHistoryKeys.add(historyKey);
         for (const v of normalizedVariants) {
             knownMemeVariants.add(v);
         }
         acceptedMemesCount++;
 
-        const contentParts = [
-            `[群梗: ${attestedTerm}]`,
-            `真实含义: ${meaning}`,
-            originContext ? `来源背景: ${originContext}` : "",
-            participants.length > 0 ? `相关成员: ${[...new Set(participants)].join(", ")}` : "",
-            `使用边界: ${usageBoundaries}`,
-            `使用情况: 导入的历史中 ${usage.messageCount} 条消息、${usage.senderCount} 人用过`,
-        ].filter(Boolean);
+        const content = buildMemeFactContent({
+            term: attestedTerm,
+            meaning,
+            originContext,
+            participants,
+            usageBoundaries,
+            usage: {
+                messages: usage.messageCount,
+                senders: usage.senderCount,
+            },
+        });
 
         factProposals.push({
             historyKey,
             subject: groupSubject,
-            content: contentParts.join("；"),
+            content,
             category: "anecdote",
             confidence: 0.85,
             sourceTopicId: cited.topicId,
@@ -2614,7 +2860,10 @@ function groundSynthesisOutput(
         }
         if (distinctSenders.size < MIN_OBSERVATION_DISTINCT_SENDERS) continue;
 
-        if (factProposals.some(kept => kept.category === "general" && isNearDuplicateText(kept.content, content))) {
+        if (
+            protection.rejectedObservations.some(rej => isNearDuplicateText(rej, content))
+            || factProposals.some(kept => kept.category === "general" && isNearDuplicateText(kept.content, content))
+        ) {
             continue;
         }
 
@@ -2622,7 +2871,13 @@ function groundSynthesisOutput(
             ? rec.canonicalKey.trim()
             : content;
         const historyKey = `hist_obs:${createHash("sha256").update(`${chatId}\n${canonical}`).digest("hex").slice(0, 24)}`;
-        if (seenFactHistoryKeys.has(historyKey)) continue;
+        if (
+            seenFactHistoryKeys.has(historyKey)
+            || protection.rejectedKeys.has(historyKey)
+            || protection.approvedKeys.has(historyKey)
+        ) {
+            continue;
+        }
         seenFactHistoryKeys.add(historyKey);
         acceptedObsCount++;
 
@@ -2928,4 +3183,118 @@ async function runCheckpointedEmbedStage(params: {
     }
 
     return { embeddedTopics, embeddedFacts, remainingEmbedUnits };
+}
+
+function reconstructPendingClusterWindows(
+    pendingUnits: readonly HistoryUnitRecord[],
+    eligibleMessages: readonly HistoryMessageRow[],
+): HistoryWindow[] | null {
+    const eligibleById = new Map(eligibleMessages.map(m => [m.messageId, m]));
+    const windows: HistoryWindow[] = [];
+    for (const u of pendingUnits) {
+        let parsed: { messageIds?: unknown; inputDigest?: unknown } | null = null;
+        try {
+            parsed = JSON.parse(u.inputJson) as { messageIds?: unknown; inputDigest?: unknown };
+        } catch {
+            return null;
+        }
+        if (!parsed || !Array.isArray(parsed.messageIds) || parsed.messageIds.length === 0) {
+            return null;
+        }
+        const messageIds = parsed.messageIds.filter((id): id is string => typeof id === "string" && id.length > 0);
+        if (messageIds.length !== parsed.messageIds.length) {
+            return null;
+        }
+        const msgs: HistoryMessageRow[] = [];
+        for (const mid of messageIds) {
+            const row = eligibleById.get(mid);
+            if (!row) {
+                return null;
+            }
+            msgs.push(row);
+        }
+        const inputDigest = typeof parsed.inputDigest === "string" && parsed.inputDigest
+            ? parsed.inputDigest
+            : computeMessagesDigest(toDigestFields(msgs));
+        windows.push({
+            unitKey: u.unitKey,
+            messages: msgs,
+            messageIds,
+            startedAt: msgs[0].timestamp,
+            endedAt: msgs[msgs.length - 1].timestamp,
+            inputDigest,
+        });
+    }
+    return windows;
+}
+
+function reconstructPendingSynthesisBatches(
+    pendingUnits: readonly HistoryUnitRecord[],
+    batchByKey: ReadonlyMap<string, SynthesisMacroBatch>,
+    historicalTopics: readonly TopicNode[],
+    memory: MemoryStoreV2,
+    chatId: string,
+): SynthesisMacroBatch[] | null {
+    const topicById = new Map(historicalTopics.map(t => [t.id, t]));
+    const batches: SynthesisMacroBatch[] = [];
+
+    for (const u of pendingUnits) {
+        const direct = batchByKey.get(u.unitKey);
+        if (direct) {
+            batches.push(direct);
+            continue;
+        }
+        interface ParsedSynthInput {
+            isoWeek?: unknown;
+            topicIds?: unknown;
+            maxSampleMessagesPerTopic?: unknown;
+        }
+        let parsed: ParsedSynthInput | null = null;
+        try {
+            parsed = JSON.parse(u.inputJson) as ParsedSynthInput;
+        } catch {
+            return null;
+        }
+        if (!parsed || !Array.isArray(parsed.topicIds) || parsed.topicIds.length === 0) {
+            return null;
+        }
+        const batchTopics: TopicNode[] = [];
+        for (const tid of parsed.topicIds) {
+            if (typeof tid !== "string") return null;
+            const topic = topicById.get(tid);
+            if (!topic) return null;
+            batchTopics.push(topic);
+        }
+        const maxSample = typeof parsed.maxSampleMessagesPerTopic === "number" && parsed.maxSampleMessagesPerTopic > 0
+            ? Math.floor(parsed.maxSampleMessagesPerTopic)
+            : DEFAULT_MAX_SAMPLE_MESSAGES_PER_TOPIC;
+        const topicBlocks: SynthesisTopicBlock[] = [];
+        for (const topic of batchTopics) {
+            const msgIds = topic.messageRange?.messageIds ?? [];
+            const fetched = memory.getEligibleHistoryMessagesByIds(chatId, msgIds);
+            if (fetched.length === 0) return null;
+            fetched.sort((a, b) =>
+                (a.timestampMs - b.timestampMs)
+                || (a.messageId < b.messageId ? -1 : a.messageId > b.messageId ? 1 : 0),
+            );
+            topicBlocks.push(buildSynthesisTopicBlock(topic, fetched, memory, chatId, maxSample));
+        }
+        const isoWeek = typeof parsed.isoWeek === "string" && parsed.isoWeek
+            ? parsed.isoWeek
+            : getUtcIsoWeekKey(batchTopics[0].startedAt);
+        const lastEnded = batchTopics[batchTopics.length - 1]?.endedAt
+            ?? batchTopics[batchTopics.length - 1]?.startedAt
+            ?? "";
+        const rankKey = `${isoWeek}#${String(u.ordinal).padStart(4, "0")}:${lastEnded}`;
+        batches.push({
+            unitKey: u.unitKey,
+            isoWeek,
+            rankKey,
+            topics: batchTopics,
+            topicBlocks,
+            inputJson: u.inputJson,
+        });
+    }
+
+    return batches;
 }

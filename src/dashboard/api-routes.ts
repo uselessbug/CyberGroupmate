@@ -41,6 +41,13 @@ import { extractAnimatedStickerFrames } from "../core/vision-processor.js";
 import type { MainAgentGlobalState, SchedulerEvent, SessionDigestEntry } from "../subagent/types.js";
 import { createCronApi, createReminderApi } from "../meta-sandbox/meta-api/scheduler.js";
 import { createTodoApi } from "../meta-sandbox/meta-api/todo.js";
+import { isChatPrivateOrSensitive, runHistoryInitializationWithMemory } from "../history/initialize.js";
+import type {
+    HistoryFactKind,
+    HistoryFactReviewAction,
+    HistoryFactReviewStatus,
+    HistoryFactSort,
+} from "../memory-v2/index.js";
 
 const log = createLogger("dashboard-api");
 const SKILLS_ROOT = join(process.cwd(), "workspace", "skills");
@@ -2369,6 +2376,259 @@ export function createApiRouter(deps: DashboardDeps, bridge: EventBridge): Route
                 .map((line) => JSON.parse(line))
                 .filter((event) => !Number.isFinite(after) || Number(event.id) > after);
             res.json({ runId: run.id, events, source: "log", logPath: run.logPath });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    // ─── History Import & Review ───
+
+    router.get("/history/overview", (_req, res) => {
+        try {
+            const running = deps.historyRunner?.current() ?? null;
+            const config = loadConfig();
+            const rawChats = deps.memory.getHistoryOverviewChats(running?.chatId ?? null);
+            const chats = rawChats.map((chat) => ({
+                chatId: chat.chatId,
+                chatTitle: chat.chatTitle,
+                isPrivateOrSensitive: isChatPrivateOrSensitive(deps.memory, chat.chatId, config),
+                messages: chat.messages,
+                topics: chat.topics,
+                facts: chat.facts,
+                importJobs: chat.importJobs,
+                initJob: chat.initJob,
+            }));
+            res.json({
+                runner: { running },
+                chats,
+            });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.post("/history/init/estimate", async (req, res) => {
+        try {
+            const chatId = typeof req.body?.chatId === "string" ? req.body.chatId.trim() : "";
+            if (!chatId) {
+                res.status(400).json({ error: "chatId required" });
+                return;
+            }
+            const rawMode = req.body?.mode ?? "quick";
+            if (rawMode !== "quick" && rawMode !== "full") {
+                res.status(400).json({ error: "invalid mode" });
+                return;
+            }
+            const summary = await runHistoryInitializationWithMemory(deps.memory, {
+                chatId,
+                mode: rawMode,
+                stage: "all",
+                dryRun: true,
+                config: loadConfig(),
+            });
+            res.json({
+                eligibleMessages: summary.eligibleMessages,
+                totalWindows: summary.totalWindows,
+                uncoveredWindows: summary.uncoveredWindows,
+                selectedWindows: summary.selectedWindows,
+                estimatedClusterCalls: summary.estimatedClusterCalls,
+                estimatedSynthesisCalls: summary.estimatedSynthesisCalls,
+                isPrivateOrSensitive: summary.isPrivateOrSensitive,
+            });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.post("/history/init/start", (req, res) => {
+        try {
+            const chatId = typeof req.body?.chatId === "string" ? req.body.chatId.trim() : "";
+            if (!chatId) {
+                res.status(400).json({ error: "chatId required" });
+                return;
+            }
+            const rawMode = req.body?.mode ?? "quick";
+            if (rawMode !== "quick" && rawMode !== "full") {
+                res.status(400).json({ error: "invalid mode" });
+                return;
+            }
+            if (!deps.historyRunner) {
+                res.status(503).json({ error: "history runner not available" });
+                return;
+            }
+            const result = deps.historyRunner.start({
+                chatId,
+                mode: rawMode,
+                allowPrivateLlm: req.body?.allowPrivateLlm === true,
+            });
+            if (!result.ok) {
+                if (result.error === "busy") {
+                    res.status(409).json({ error: "busy", running: result.running });
+                    return;
+                }
+                res.status(400).json({ error: result.error });
+                return;
+            }
+            res.status(202).json({ ok: true });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.post("/history/init/stop", (req, res) => {
+        try {
+            const chatId = typeof req.body?.chatId === "string" ? req.body.chatId.trim() : "";
+            if (!chatId) {
+                res.status(400).json({ error: "chatId required" });
+                return;
+            }
+            if (!deps.historyRunner) {
+                res.status(503).json({ error: "history runner not available" });
+                return;
+            }
+            const ok = deps.historyRunner.stop(chatId);
+            res.json({ ok });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.get("/history/facts", (req, res) => {
+        try {
+            const chatId = qs(req.query.chatId).trim();
+            if (!chatId) {
+                res.status(400).json({ error: "chatId required" });
+                return;
+            }
+            const rawKind = qs(req.query.kind).trim() || "meme";
+            if (rawKind !== "meme" && rawKind !== "observation") {
+                res.status(400).json({ error: "invalid kind" });
+                return;
+            }
+            const rawStatus = qs(req.query.status).trim() || "pending";
+            if (rawStatus !== "pending" && rawStatus !== "approved" && rawStatus !== "rejected") {
+                res.status(400).json({ error: "invalid status" });
+                return;
+            }
+            const rawSort = qs(req.query.sort).trim() || "recent";
+            if (rawSort !== "recent" && rawSort !== "usage_desc" && rawSort !== "usage_asc") {
+                res.status(400).json({ error: "invalid sort" });
+                return;
+            }
+            const rawLimit = qs(req.query.limit).trim();
+            let limit = 30;
+            if (rawLimit !== "") {
+                const parsed = Number(rawLimit);
+                if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
+                    res.status(400).json({ error: "invalid limit" });
+                    return;
+                }
+                limit = Math.min(parsed, 100);
+            }
+            const rawOffset = qs(req.query.offset).trim();
+            let offset = 0;
+            if (rawOffset !== "") {
+                const parsed = Number(rawOffset);
+                if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+                    res.status(400).json({ error: "invalid offset" });
+                    return;
+                }
+                offset = parsed;
+            }
+            const q = qs(req.query.q).trim();
+            const result = deps.memory.listHistoryFacts({
+                chatId,
+                kind: rawKind as HistoryFactKind,
+                status: rawStatus as HistoryFactReviewStatus,
+                q,
+                sort: rawSort as HistoryFactSort,
+                limit,
+                offset,
+            });
+            res.json(result);
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.get("/history/evidence", (req, res) => {
+        try {
+            const chatId = qs(req.query.chatId).trim();
+            const historyKey = qs(req.query.historyKey).trim();
+            if (!chatId || !historyKey) {
+                res.status(400).json({ error: "chatId and historyKey required" });
+                return;
+            }
+            const evidence = deps.memory.getHistoryFactEvidence(chatId, historyKey);
+            if (!evidence) {
+                res.status(404).json({ error: "history fact not found" });
+                return;
+            }
+            res.json(evidence);
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.post("/history/facts/review", (req, res) => {
+        try {
+            const chatId = typeof req.body?.chatId === "string" ? req.body.chatId.trim() : "";
+            if (!chatId) {
+                res.status(400).json({ error: "chatId required" });
+                return;
+            }
+            const action = req.body?.action;
+            if (action !== "approve" && action !== "reject" && action !== "reset" && action !== "restore") {
+                res.status(400).json({ error: "invalid action" });
+                return;
+            }
+            const rawKeys = req.body?.historyKeys;
+            if (!Array.isArray(rawKeys)) {
+                res.status(400).json({ error: "historyKeys array required" });
+                return;
+            }
+            if (rawKeys.length > 500) {
+                res.status(400).json({ error: "historyKeys exceeds max 500" });
+                return;
+            }
+            const historyKeys: string[] = [];
+            for (const key of rawKeys) {
+                if (typeof key !== "string" || !key.trim()) {
+                    res.status(400).json({ error: "historyKeys must contain non-empty strings" });
+                    return;
+                }
+                historyKeys.push(key.trim());
+            }
+            const affected = deps.memory.reviewHistoryFacts(chatId, action as HistoryFactReviewAction, historyKeys);
+            res.json({ ok: true, affected });
+        } catch (err) {
+            res.status(500).json({ error: String(err) });
+        }
+    });
+
+    router.put("/history/facts", (req, res) => {
+        try {
+            const chatId = typeof req.body?.chatId === "string" ? req.body.chatId.trim() : "";
+            const historyKey = typeof req.body?.historyKey === "string" ? req.body.historyKey.trim() : "";
+            if (!chatId || !historyKey) {
+                res.status(400).json({ error: "chatId and historyKey required" });
+                return;
+            }
+            const result = deps.memory.editHistoryFact({
+                chatId,
+                historyKey,
+                meme: req.body?.meme,
+                content: req.body?.content,
+            });
+            if (result.status === "not_found") {
+                res.status(404).json({ error: "history fact not found" });
+                return;
+            }
+            if (result.status === "invalid") {
+                res.status(400).json({ error: result.error });
+                return;
+            }
+            res.json({ ok: true, item: result.item });
         } catch (err) {
             res.status(500).json({ error: String(err) });
         }

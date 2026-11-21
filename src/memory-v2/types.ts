@@ -15,16 +15,25 @@ import type { MessageMention } from "../core/message-provenance.js";
 import type { ChatNameHit, ChatNameKind, ChatNameObservation, LatestChatNameRecord } from "./chat-names.js";
 import type {
     ChatActivityStats,
+    EditHistoryFactInput,
+    EditHistoryFactResult,
     HistoryCheckpoint,
     HistoryClusterCommitInput,
     HistoryClusterCommitResult,
     HistoryClusterTopicInput,
+    HistoryDashboardFactItem,
     HistoryEmbeddingCommitInput,
+    HistoryFactEvidenceResult,
+    HistoryFactKind,
+    HistoryFactReviewAction,
+    HistoryFactReviewStatus,
+    HistoryFactSort,
     HistoryFinalizeQceImportInput,
     HistoryJobKind,
     HistoryJobRecord,
     HistoryJobStatus,
     HistoryLease,
+    HistoryOverviewChatRecord,
     HistorySynthesisCitation,
     HistorySynthesisCommitInput,
     HistorySynthesisCommitResult,
@@ -33,11 +42,14 @@ import type {
     HistorySynthesisFactProposal,
     HistorySynthesisGroupPatch,
     HistorySynthesisMemberPatch,
+    HistorySynthesisProtectionData,
     HistoryUnitInput,
     HistoryUnitRecord,
     HistoryUnitStage,
     IngestBatchResult,
     IngestMessage,
+    ListHistoryFactsOptions,
+    ListHistoryFactsResult,
     MemeVariantUsageCounts,
     MessageOrigin,
     UpsertHistoryJobInput,
@@ -48,16 +60,25 @@ export type {
     ChatNameHit,
     ChatNameKind,
     ChatNameObservation,
+    EditHistoryFactInput,
+    EditHistoryFactResult,
     HistoryCheckpoint,
     HistoryClusterCommitInput,
     HistoryClusterCommitResult,
     HistoryClusterTopicInput,
+    HistoryDashboardFactItem,
     HistoryEmbeddingCommitInput,
+    HistoryFactEvidenceResult,
+    HistoryFactKind,
+    HistoryFactReviewAction,
+    HistoryFactReviewStatus,
+    HistoryFactSort,
     HistoryFinalizeQceImportInput,
     HistoryJobKind,
     HistoryJobRecord,
     HistoryJobStatus,
     HistoryLease,
+    HistoryOverviewChatRecord,
     HistorySynthesisCitation,
     HistorySynthesisCommitInput,
     HistorySynthesisCommitResult,
@@ -66,11 +87,14 @@ export type {
     HistorySynthesisFactProposal,
     HistorySynthesisGroupPatch,
     HistorySynthesisMemberPatch,
+    HistorySynthesisProtectionData,
     HistoryUnitInput,
     HistoryUnitRecord,
     HistoryUnitStage,
     IngestBatchResult,
     IngestMessage,
+    ListHistoryFactsOptions,
+    ListHistoryFactsResult,
     MemeVariantUsageCounts,
     MessageOrigin,
     UpsertHistoryJobInput,
@@ -434,6 +458,8 @@ export interface CoreFact {
     sensitivity?: "low" | "medium" | "high";
     /** 离线历史综合幂等键（仅离线历史事实非空） */
     historyKey?: string | null;
+    /** 离线历史事实审核状态 */
+    historyReview?: "approved" | null;
     /** 向量表示 */
     embedding?: Float32Array;
     /** 创建时间 (ISO 8601) */
@@ -825,6 +851,14 @@ export interface IMemoryStoreV2 {
     commitHistoricalClusterUnit(input: HistoryClusterCommitInput): HistoryClusterCommitResult;
     commitHistoricalSynthesisUnit(input: HistorySynthesisCommitInput): HistorySynthesisCommitResult;
     commitHistoricalEmbeddingUnit(input: HistoryEmbeddingCommitInput): void;
+    getHistoryLease(chatId: string): HistoryLease | null;
+    listCompletedHistoryUnitKeys(chatId: string, kind: HistoryJobKind, stage: HistoryUnitStage): Set<string>;
+    getSynthesisProtectionData(chatId: string): HistorySynthesisProtectionData;
+    listHistoryFacts(options: ListHistoryFactsOptions): ListHistoryFactsResult;
+    reviewHistoryFacts(chatId: string, action: HistoryFactReviewAction, historyKeys: readonly string[]): number;
+    editHistoryFact(input: EditHistoryFactInput): EditHistoryFactResult;
+    getHistoryFactEvidence(chatId: string, historyKey: string): HistoryFactEvidenceResult | null;
+    getHistoryOverviewChats(activeRunnerChatId: string | null): HistoryOverviewChatRecord[];
     finalizeQceImport(input: HistoryFinalizeQceImportInput): ChatActivityStats | null;
 
     /** 从 message_log 重算并仅更新 group_models 活动统计字段 */
