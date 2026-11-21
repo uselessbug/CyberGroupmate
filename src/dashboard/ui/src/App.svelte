@@ -17,6 +17,7 @@
   import LLMLogPanel from './panels/LLMLogPanel.svelte';
   import TokenStatsPanel from './panels/TokenStatsPanel.svelte';
   import MemoryPanel from './panels/MemoryPanel.svelte';
+  import HistoryPanel from './panels/HistoryPanel.svelte';
   import StickersPanel from './panels/StickersPanel.svelte';
   import SkillsPanel from './panels/SkillsPanel.svelte';
   import SchedulerPanel from './panels/SchedulerPanel.svelte';
@@ -72,6 +73,7 @@
     <div class:hidden={$activeTab !== 'llm-log'}><LLMLogPanel /></div>
     <div class:hidden={$activeTab !== 'token-stats'}><TokenStatsPanel /></div>
     <div class:hidden={$activeTab !== 'memory'}><MemoryPanel /></div>
+    <div class:hidden={$activeTab !== 'history'}><HistoryPanel /></div>
     <div class:hidden={$activeTab !== 'stickers'}><StickersPanel /></div>
     <div class:hidden={$activeTab !== 'skills'}><SkillsPanel /></div>
     <div class:hidden={$activeTab !== 'scheduler'}><SchedulerPanel /></div>
