@@ -49,6 +49,38 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=
 
+      - name: Build native Docker image for smoke test
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.name }}:smoke-test
+          cache-from: type=gha,scope=base
+
+      - name: Smoke test history CLI and system prompts in image
+        run: |
+          docker run --rm --network none --entrypoint sh "${{ steps.image.outputs.name }}:smoke-test" -ec '
+            for f in \
+              /app/system-prompts/memory/history-cluster.md \
+              /app/system-prompts/memory/history-topic-summary.md \
+              /app/system-prompts/memory/history-synthesis-system.md \
+              /app/system-prompts/memory/history-synthesis-user.md; do
+              test -s "$f"
+            done
+            /app/node_modules/.bin/tsx /app/src/cli.ts history import --help >/dev/null
+            /app/node_modules/.bin/tsx /app/src/cli.ts history init --help >/dev/null
+            cat << "EOF" > /tmp/qce-smoke.json
+          {
+            "chatInfo": { "name": "Smoke Group", "type": "group", "peerUid": "123456", "peerUin": "123456" },
+            "messages": [
+              { "id": "1", "type": "type_1", "timestamp": 1714521600, "sender": { "uid": "u_alice", "uin": "10001", "nickname": "Alice" }, "content": { "text": "hello" } }
+            ]
+          }
+          EOF
+            /app/node_modules/.bin/tsx /app/src/cli.ts history import /tmp/qce-smoke.json --dry-run >/dev/null
+          '
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
