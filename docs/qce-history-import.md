@@ -206,13 +206,15 @@ docker exec -it cybergroupmate \
 
 如果主容器尚未启动，可以通过覆盖 `--entrypoint` 挂载宿主机导出目录、`workspace` 和 `config.yaml` 运行一次性导入任务：
 
+> 镜像必须包含本功能：把 `<owner>` 换成构建了这些提交的仓库（例如你自己的 fork 合入 `agentic` 后由 Actions 构建的镜像）。`--self-id` 填机器人账号的 QQ 号，不是导出者本人的。
+
 ```bash
 docker run --rm \
   --entrypoint /app/node_modules/.bin/tsx \
   -v "$(pwd)/workspace:/app/workspace" \
   -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
   -v "/path/to/host/qce-export:/data/qce-export:ro" \
-  ghcr.io/archeb/cybergroupmate:agentic \
+  ghcr.io/<owner>/cybergroupmate:agentic \
   /app/src/cli.ts history init \
   --input /data/qce-export \
   --db /app/workspace/memory.db \
