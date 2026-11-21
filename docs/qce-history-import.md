@@ -92,7 +92,7 @@ pnpm qce-import /path/to/qce-export \
 - `--timezone <IANA>`：用于解析无时区时间字符串（`timeStr` / `--since` / `--until`）及计算活跃小时分布（`stats_hour` / `peak_hours`）的 IANA 时区（默认优先读取 `config.yaml` 中的 `timezone`，再回退系统时区或 `UTC`）。活跃小时在**首次导入时写定**，重复导入不会修正；输出摘要的 `timezone` 字段显示实际采用的时区，回退到 `UTC` 时 `warnings` 会给出提示，请先用 `--dry-run` 确认。
 - `--include-system` / `--include-recalled`：默认跳过系统提示消息与已撤回消息。开启 `--include-recalled` 时，为保护隐私，撤回消息的原始正文在进入临时缓存库（spool）前即被剥离，仅以 `"[已撤回消息]"` 占位写入且不计入人类发言统计。系统提示（戳一戳、精华消息等）的文本由导出者的 QQ 客户端渲染，可能包含导出者给好友设置的私人备注，开启 `--include-system` 前请留意。
 
-消息文本按 `content.elements` 逐段重建，不沿用 QCE 的 `content.text`：`[图片:<md5>.png]`、`[回复消息]`、`[JSON消息]` 等导出专用标记不会入库，图片与表情包（`subType: "sticker"`）分别记为 `[📷 图片]` / `[🎭 表情包]`，回复关系只保存在 `reply_to_message_id`。遇到无法识别的元素类型时才保留 QCE 原文。合并转发内的发言人统一显示为 `成员A` / `成员B`：QCE 按导出者视角给这些人取名，好友备注（常为真实姓名）与公开昵称无法区分。
+消息文本按 `content.elements` 逐段重建，不沿用 QCE 的 `content.text`：`[图片:<md5>.png]`、`[回复消息]`、`[JSON消息]` 等导出专用标记不会入库，图片与表情包（`subType: "sticker"`）分别记为 `[📷 图片]` / `[🎭 表情包]`，回复关系只保存在 `reply_to_message_id`。遇到无法识别的元素类型时才保留 QCE 原文。合并转发内的发言人统一显示为 `成员A` / `成员B`：QCE 按导出者视角给这些人取名，好友备注（常为真实姓名）与公开昵称无法区分。导出者给好友设的备注（`sender.remark`）只在导入时用来识别并剔除被它顶替的 `sender.name`，不会写入数据库。
 
 ---
 

@@ -84,7 +84,7 @@ interface ExistingMessageSnapshot {
 
 const DEFAULT_BATCH_SIZE = 500;
 const DEFAULT_BATCH_MAX_BYTES = 4 * 1024 * 1024;
-const NORMALIZATION_VERSION = "qce-v3";
+const NORMALIZATION_VERSION = "qce-v4";
 
 function createAbortError(): Error {
     const err = new Error("QCE import aborted");

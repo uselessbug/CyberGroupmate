@@ -259,7 +259,7 @@ describe("QCE historical importer", () => {
         const wire = (id: string, type: string, text: string, elements: unknown[], resources: unknown[] = []) => {
             const norm = normalizeQceMessage({
                 id, timestamp: 1714521600000, type,
-                sender: { uin: "1001", nickname: "Nick", groupCard: "Card" },
+                sender: { uin: "1001", nickname: "Nick", groupCard: "Card", remark: "ExporterPrivateRemark" },
                 content: { text, elements, resources, mentions: [] },
             } as never, wireOpts);
             assert.equal(norm.status, "ok");
@@ -269,6 +269,7 @@ describe("QCE historical importer", () => {
             { type: "image", data: { filename: "AB12.png", size: 10, subType: "sticker" } },
         ], [{ type: "image", filename: "AB12.png", size: 10 }]);
         assert.equal(stickerMsg?.text, "[🎭 表情包]");
+        assert.ok(!JSON.stringify(stickerMsg).includes("ExporterPrivateRemark"), "the exporter's remark is never persisted");
         assert.equal(stickerMsg?.mediaType, "sticker");
         assert.deepEqual(JSON.parse(stickerMsg?.mediaInfo ?? "{}").counts, { sticker: 1 });
 

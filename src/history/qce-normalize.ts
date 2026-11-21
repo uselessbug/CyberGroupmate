@@ -148,7 +148,6 @@ export interface QceMessageMeta {
     groupCard?: string;
     nickname?: string;
     name?: string;
-    remark?: string;
     title?: string;
     seq?: string;
     messageType?: string;
@@ -716,6 +715,8 @@ export function normalizeQceMessage(
     const senderCard = cleanDisplayName(sender.groupCard ?? sender.card);
     const senderNickname = cleanDisplayName(sender.nickname ?? sender.nick);
     const rawSenderName = cleanDisplayName(sender.name);
+    // The exporter's private remark for this person (often a real name). It is only
+    // compared against `name` below and is never stored: the agent's shell can read memory.db.
     const senderRemark = cleanOptionalText(sender.remark);
     const safeSenderName = rawSenderName && (!senderRemark || rawSenderName !== senderRemark)
         ? rawSenderName
@@ -751,7 +752,6 @@ export function normalizeQceMessage(
         ...(senderCard ? { groupCard: senderCard.slice(0, MAX_META_STRING_LEN) } : {}),
         ...(senderNickname ? { nickname: senderNickname.slice(0, MAX_META_STRING_LEN) } : {}),
         ...(safeSenderName ? { name: safeSenderName.slice(0, MAX_META_STRING_LEN) } : {}),
-        ...(senderRemark ? { remark: senderRemark } : {}),
         ...(senderTitle ? { title: senderTitle } : {}),
         ...(seqStr ? { seq: seqStr } : {}),
         ...(messageTypeStr ? { messageType: messageTypeStr } : {}),
