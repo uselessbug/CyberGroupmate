@@ -15,6 +15,7 @@ import type {
 import WebSocket, { type RawData } from "ws";
 import type { LLMConfig } from "../config.js";
 import { createLogger } from "../logger.js";
+import { enrichSdkProviderError } from "./http-error.js";
 import { reasoningOriginKey } from "./reasoning-origin.js";
 import type { ChatMessage, LLMResponse } from "./types.js";
 
@@ -94,28 +95,32 @@ export async function callOpenAIResponses(
     const requestMode = config.responsesRequestMode ?? "non_stream";
     let websocketSessionId: string | undefined;
     let response: ResponsesResult;
-    if (requestMode === "websocket") {
-        try {
-            const result = await callOpenAIResponsesWebSocket(messages, config, requestBody, originKey, prefill, signal);
-            websocketSessionId = result.sessionId;
-            response = result.response;
-        } catch (error) {
-            if (signal?.aborted || !isRetryableResponsesWebSocketError(error)) throw error;
+    try {
+        if (requestMode === "websocket") {
+            try {
+                const result = await callOpenAIResponsesWebSocket(messages, config, requestBody, originKey, prefill, signal);
+                websocketSessionId = result.sessionId;
+                response = result.response;
+            } catch (error) {
+                if (signal?.aborted || !isRetryableResponsesWebSocketError(error)) throw error;
 
-            // Responses 的 encrypted reasoning 同样能通过普通 HTTP 往返；WS 只负责
-            // 连接内 previous_response_id 续链。上游 WS 代理繁忙时直接用完整 input
-            // 降级到 HTTP，既保留 reasoning，也避免反复撞同一个 WS 入口。
-            log.warn("Responses WebSocket unavailable; falling back to HTTP", {
-                error: error instanceof Error ? error.message : String(error),
-            });
+                // Responses 的 encrypted reasoning 同样能通过普通 HTTP 往返；WS 只负责
+                // 连接内 previous_response_id 续链。上游 WS 代理繁忙时直接用完整 input
+                // 降级到 HTTP，既保留 reasoning，也避免反复撞同一个 WS 入口。
+                log.warn("Responses WebSocket unavailable; falling back to HTTP", {
+                    error: error instanceof Error ? error.message : String(error),
+                });
+                response = await client.responses.create(requestBody, { signal }) as ResponsesResult;
+            }
+        } else if (requestMode === "stream") {
+            response = await collectResponseFromStream(
+                await client.responses.create({ ...requestBody, stream: true }, { signal }),
+            );
+        } else {
             response = await client.responses.create(requestBody, { signal }) as ResponsesResult;
         }
-    } else if (requestMode === "stream") {
-        response = await collectResponseFromStream(
-            await client.responses.create({ ...requestBody, stream: true }, { signal }),
-        );
-    } else {
-        response = await client.responses.create(requestBody, { signal }) as ResponsesResult;
+    } catch (err) {
+        throw enrichSdkProviderError(err);
     }
 
     const content = response.output_text ?? "";

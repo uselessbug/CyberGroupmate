@@ -8,6 +8,7 @@
 
 import { GoogleGenAI, type Content, type Part } from "@google/genai";
 import type { LLMConfig } from "../config.js";
+import { enrichSdkProviderError } from "./http-error.js";
 import type { ChatMessage, LLMResponse } from "./types.js";
 
 // ─── SDK 实例缓存（按配置指纹复用） ───
@@ -132,17 +133,22 @@ export async function callGoogle(
     }
 
     // ── 调用 SDK ──
-    const response = await client.models.generateContent({
-        model,
-        contents,
-        config: {
-            ...(config.omit_temperature ? {} : { temperature }),
-            maxOutputTokens: maxTokens,
-            ...(systemInstruction ? { systemInstruction } : {}),
-            ...(stop && stop.length > 0 ? { stopSequences: stop } : {}),
-            ...(signal ? { abortSignal: signal } : {}),
-        },
-    });
+    let response;
+    try {
+        response = await client.models.generateContent({
+            model,
+            contents,
+            config: {
+                ...(config.omit_temperature ? {} : { temperature }),
+                maxOutputTokens: maxTokens,
+                ...(systemInstruction ? { systemInstruction } : {}),
+                ...(stop && stop.length > 0 ? { stopSequences: stop } : {}),
+                ...(signal ? { abortSignal: signal } : {}),
+            },
+        });
+    } catch (err) {
+        throw enrichSdkProviderError(err);
+    }
 
     const text = response.text ?? "";
     if (!text) {

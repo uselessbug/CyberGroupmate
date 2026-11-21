@@ -174,6 +174,18 @@ export interface LLMCallOptions {
      * 降级 → describeImage → 再降级 的递归护栏。
      */
     noVisionDegrade?: boolean;
+    /**
+     * Optional point-of-use guard invoked immediately before EVERY outbound attempt
+     * (initial request, profile fallback, pool key retry, and internal transient retry).
+     */
+    beforeAttempt?: () => void;
+}
+
+class BeforeAttemptGuardError extends Error {
+    constructor(public readonly causeError: unknown) {
+        super(causeError instanceof Error ? causeError.message : String(causeError));
+        this.name = "BeforeAttemptGuardError";
+    }
 }
 
 export const LLM_PENDING_MESSAGE_ABORT = "pending_message";
@@ -367,6 +379,21 @@ export async function callLLM(
     config: LLMConfig,
     options?: LLMCallOptions
 ): Promise<LLMResponse> {
+    try {
+        return await callLLMInternal(messages, config, options);
+    } catch (err) {
+        if (err instanceof BeforeAttemptGuardError) {
+            throw err.causeError;
+        }
+        throw err;
+    }
+}
+
+async function callLLMInternal(
+    messages: ChatMessage[],
+    config: LLMConfig,
+    options?: LLMCallOptions
+): Promise<LLMResponse> {
     // ── per-profile replyPrompt：按实际选中的 profile 追加到最后一条 user 消息（不改原数组） ──
     // 放在 callLLM 入口，使 fallback 选中 configs[i] 时用的是 configs[i] 自己的 replyPrompt。
     if (options?.applyReplyPrompt && config.replyPrompt) {
@@ -404,6 +431,13 @@ async function callLLMWithPool(
     let lastError: Error | null = null;
 
     for (let i = 0; i < maxPoolAttempts; i++) {
+        if (options?.beforeAttempt) {
+            try {
+                options.beforeAttempt();
+            } catch (guardErr) {
+                throw new BeforeAttemptGuardError(guardErr);
+            }
+        }
         const handle = pool.acquire();
         if (!handle) {
             // 所有 key 冷却中或已禁用，跳出走 fallback（如果有）或抛错
@@ -423,6 +457,10 @@ async function callLLMWithPool(
             pool.release(handle, true);
             return result;
         } catch (err) {
+            if (err instanceof BeforeAttemptGuardError) {
+                pool.release(handle, true);
+                throw err;
+            }
             const quota = isQuotaError(err);
             const auth = isAuthError(err);
             pool.release(handle, false, quota, auth);
@@ -532,6 +570,15 @@ async function _callLLMSingleKeyInner(
 
     try {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        // Point-of-use guard BEFORE every outbound attempt (including transient retries)
+        if (options?.beforeAttempt) {
+            try {
+                options.beforeAttempt();
+            } catch (guardErr) {
+                throw new BeforeAttemptGuardError(guardErr);
+            }
+        }
+
         // 检查是否已被用户取消（上一次循环中可能被 abort）
         // 如果被取消，重置 controller 以便下一次 fetch 正常使用
         let wasUserRetry = false;
@@ -965,6 +1012,7 @@ export async function callLLMWithFallback(
 
     let lastError: Error | null = null;
     for (let i = 0; i < configs.length; i++) {
+        options?.beforeAttempt?.();
         const config = configs[i];
         const payload = await payloadFor(i);
         if (payload !== messages) {
@@ -978,8 +1026,11 @@ export async function callLLMWithFallback(
             });
         }
         try {
-            return await callLLM(payload, config, options);
+            return await callLLMInternal(payload, config, options);
         } catch (err) {
+            if (err instanceof BeforeAttemptGuardError) {
+                throw err.causeError;
+            }
             if (isLLMInterruptedByPendingMessage(err)) {
                 throw err;
             }
