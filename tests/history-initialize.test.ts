@@ -19,11 +19,13 @@ import {
     runReflection,
     trimProfileByTier,
 } from "../src/memory-v2/index.js";
-import { runHistoryInitialization, runHistoryInitializationWithMemory, type HistoryLlmCallFn } from "../src/history/initialize.js";
+import { attestMemeTerm, looksTruncatedJson, runHistoryInitialization, runHistoryInitializationWithMemory, type HistoryLlmCallFn } from "../src/history/initialize.js";
 import { dryRunQceImport, importQce } from "../src/history/qce-import.js";
 import { openSqliteReadOnlyStrict } from "../src/history/sqlite-readonly.js";
 import {
+    DEFAULT_MAX_TOPICS_PER_BATCH,
     buildHistoryWindows,
+    buildSynthesisMacroBatches,
     loadEligibleHistoryMessages,
     selectWindowsForMode,
     toDigestFields,
@@ -280,14 +282,14 @@ describe("History offline clustering & social memory initialization", () => {
             assert.equal(res1.topicsCommitted, 2);
             assert.equal(mem.getCoveredMessageIds(chatId).size, 30);
 
-            // Part B: synthesis invalid/truncated JSON pauses job and never commits empty; --resume succeeds
+            // Part B: synthesis JSON that is complete but invalid pauses job and never commits empty; --resume succeeds
             const synthTopic = mem.getHistoricalTopicsForChat(chatId)[0];
             let attempt = 0;
             const flakySynthLlm: HistoryLlmCallFn = async (opts) => {
                 attempt++;
                 if (attempt <= 2) {
-                    // Initial + schema repair both return truncated JSON
-                    return { content: '{"groupUpdates": {"description": "trunc' };
+                    // Initial + schema repair both return closed-but-invalid JSON
+                    return { content: '{"groupUpdates": {"description": oops}}' };
                 }
                 return {
                     content: JSON.stringify({
@@ -431,14 +433,15 @@ describe("History offline clustering & social memory initialization", () => {
         try {
             seedMessages(mem, chatId, [
                 { id: "m1", userId: "onebot:111", name: "Alice", text: "Bob真是现充闲虫哈哈哈", ts: "2025-03-02T10:00:00.000Z" },
-                { id: "m2", userId: "onebot:222", name: "Bob", text: "别黑我了，晚上打游戏吗", ts: "2025-03-02T10:01:00.000Z" },
+                { id: "m2", userId: "onebot:222", name: "Bob", text: "别叫我闲虫了，晚上打游戏吗", ts: "2025-03-02T10:01:00.000Z" },
+                { id: "m3", userId: "onebot:111", name: "Alice", text: "好啊，晚上开黑打游戏", ts: "2025-03-02T10:02:00.000Z" },
             ]);
 
             const llmCall: HistoryLlmCallFn = async (opts) => {
                 if (opts.stage === "cluster") {
                     return {
                         content: JSON.stringify({
-                            topics: [{ tempId: "t1", label: "闲虫调侃", messageIds: ["m1", "m2"] }],
+                            topics: [{ tempId: "t1", label: "闲虫调侃", messageIds: ["m1", "m2", "m3"] }],
                         }),
                     };
                 }
@@ -502,7 +505,7 @@ describe("History offline clustering & social memory initialization", () => {
                                 canonicalKey: "evening-gaming",
                                 content: "群友习惯在玩笑后约晚上一起打游戏",
                                 topicId: topic.id,
-                                messageIds: ["m2"],
+                                messageIds: ["m2", "m3"],
                             },
                         ],
                     }),
@@ -663,6 +666,7 @@ describe("History offline clustering & social memory initialization", () => {
         try {
             seedMessages(mem, chatA, [
                 { id: "a1", userId: "onebot:111", name: "Alice", text: "咱们群特有暗号叫量子咸鱼", ts: "2025-04-01T10:00:00.000Z" },
+                { id: "a2", userId: "onebot:222", name: "Bob", text: "对对对，量子咸鱼启动", ts: "2025-04-01T10:01:00.000Z" },
             ]);
             seedMessages(mem, chatB, [
                 { id: "b1", userId: "onebot:333", name: "Carol", text: "普通聊天", ts: "2025-04-01T11:00:00.000Z" },
@@ -670,7 +674,7 @@ describe("History offline clustering & social memory initialization", () => {
 
             const llmCallA: HistoryLlmCallFn = async (opts) => {
                 if (opts.stage === "cluster") {
-                    return { content: JSON.stringify({ topics: [{ tempId: "t1", label: "量子咸鱼暗号", messageIds: ["a1"] }] }) };
+                    return { content: JSON.stringify({ topics: [{ tempId: "t1", label: "量子咸鱼暗号", messageIds: ["a1", "a2"] }] }) };
                 }
                 if (opts.stage === "summary") {
                     return { content: JSON.stringify({ summaries: [{ tempId: "t_1", label: "量子咸鱼暗号", summary: "量子咸鱼是本群专属暗号", keyPoints: ["量子咸鱼"], keywords: ["量子咸鱼"], sentiment: "positive" }] }) };
@@ -680,7 +684,7 @@ describe("History offline clustering & social memory initialization", () => {
                     content: JSON.stringify({
                         groupUpdates: {
                             description: "ChatA 文化",
-                            evidence: [{ topicId: topic.id, messageIds: ["a1"] }],
+                            evidence: [{ topicId: topic.id, messageIds: ["a1", "a2"] }],
                         },
                         memberProfiles: [],
                         memes: [{
@@ -689,7 +693,7 @@ describe("History offline clustering & social memory initialization", () => {
                             meaning: "ChatA 专属暗号，指一边摸鱼一边说在工作",
                             usageBoundaries: "仅限 ChatA 内部",
                             topicId: topic.id,
-                            messageIds: ["a1"],
+                            messageIds: ["a1", "a2"],
                         }],
                         groupObservations: [],
                     }),
@@ -1668,10 +1672,10 @@ describe("History offline clustering & social memory initialization", () => {
                     const topic = mem.getHistoricalTopicsForChat(chatId)[0];
                     return {
                         content: JSON.stringify({
-                            groupUpdates: { evidence: [{ topicId: topic.id, messageIds: ["e1"] }] },
+                            groupUpdates: { evidence: [{ topicId: topic.id, messageIds: ["e1", "e2"] }] },
                             memberProfiles: [],
                             memes: [],
-                            groupObservations: [{ canonicalKey: "obs-1", content: "群里爱聊 alpha", topicId: topic.id, messageIds: ["e1"] }],
+                            groupObservations: [{ canonicalKey: "obs-1", content: "群里爱聊 alpha", topicId: topic.id, messageIds: ["e1", "e2"] }],
                         }),
                     };
                 },
@@ -2240,5 +2244,719 @@ describe("History offline clustering & social memory initialization", () => {
         }
 
         rmDirSafe(dir);
+    });
+
+    it("16. enforces meme term attestation, rejects placeholder fields, injects already-recorded context sequentially & on split-retry, and dedupes paraphrases with caps", async () => {
+        // Bigram attestation check on paraphrased-but-attested 4+ char meme term
+        assert.equal(
+            attestMemeTerm("仙人掌扎老板的手", ["把这盆仙人掌搬进办公室，每天浇水零次，只为扎老板的手"]),
+            "仙人掌扎老板的手",
+        );
+        assert.equal(
+            attestMemeTerm("现充/闲虫", ["@Dave 早上好"]),
+            null,
+        );
+
+        const mem = createTestMemory("hist-synth-quality-guards");
+        const chatId = "onebot:group:60001";
+        const foreignChatId = "onebot:group:60002";
+        try {
+            // Seed a foreign chat historical fact to verify same-chat scoping in already-recorded prompt
+            seedMessages(mem, foreignChatId, [
+                { id: "fm1", userId: "onebot:999", name: "Foreign", text: "跨群秘密暗号", ts: "2025-01-01T10:00:00.000Z" },
+            ]);
+            const fl = mem.acquireHistoryLease(foreignChatId);
+            const fj = mem.upsertHistoryJob({ kind: "initialize", chatId: foreignChatId, inputKey: "f", optionsJson: "{}", status: "running" }, fl.ownerToken);
+            mem.upsertHistoryUnits(fj.jobId, "cluster", [{ unitKey: "fc1", ordinal: 0, inputJson: "{}" }], fl.ownerToken);
+            const fcRes = mem.commitHistoricalClusterUnit({
+                jobId: fj.jobId,
+                ownerToken: fl.ownerToken,
+                chatId: foreignChatId,
+                unitKey: "fc1",
+                expectedMessageIds: ["fm1"],
+                expectedDigest: computeMessagesDigest(toDigestFields(loadEligibleHistoryMessages(mem, foreignChatId))),
+                topics: [{
+                    historyKey: "hist_topic:foreign",
+                    label: "跨群",
+                    summary: "跨群",
+                    keyPoints: [],
+                    participants: ["onebot:999"],
+                    keywords: [],
+                    messageIds: ["fm1"],
+                    startedAt: "2025-01-01T10:00:00.000Z",
+                    endedAt: "2025-01-01T10:00:00.000Z",
+                    sentiment: "neutral",
+                }],
+                coveredPairs: [{ messageId: "fm1", topicHistoryKey: "hist_topic:foreign" }],
+                outputJson: "{}",
+            });
+            mem.upsertHistoryUnits(fj.jobId, "synthesize", [{ unitKey: "fs1", ordinal: 0, inputJson: "{}" }], fl.ownerToken);
+            mem.commitHistoricalSynthesisUnit({
+                jobId: fj.jobId,
+                ownerToken: fl.ownerToken,
+                chatId: foreignChatId,
+                unitKey: "fs1",
+                rankKey: "2025-W01#0000",
+                memberPatches: [],
+                factProposals: [{
+                    historyKey: "hist_meme:foreign",
+                    subject: `group:${foreignChatId}`,
+                    content: "[群梗: 跨群秘密暗号]；真实含义: 跨群；使用边界: 仅限外群",
+                    category: "anecdote",
+                    sourceTopicId: fcRes.topicIds[0],
+                    sourceMessageIds: ["fm1"],
+                    observedAt: "2025-01-01T10:00:00.000Z",
+                }],
+                outputJson: "{}",
+                isPrivateOrSensitive: false,
+            });
+            mem.releaseHistoryLease(foreignChatId, fl.ownerToken);
+
+            // Seed Week 1 (unit 1) and Week 2 (unit 2, with 2 topics so split-retry exercises mergeSynthesisOutputs)
+            seedMessages(mem, chatId, [
+                { id: "w1_m1", userId: "onebot:101", name: "Dave", text: "今天好累啊，把这盆仙人掌搬进办公室，每天浇水零次，只为扎老板的手", ts: "2025-01-06T10:00:00.000Z" },
+                { id: "w1_m2", userId: "onebot:102", name: "Bob", text: "哈哈哈哈接龙刷起来，我也来扎老板的手", ts: "2025-01-06T10:02:00.000Z" },
+                { id: "w2_m1", userId: "onebot:101", name: "Dave", text: "继续发图斗图", ts: "2025-01-13T10:00:00.000Z" },
+                { id: "w2_m1b", userId: "onebot:104", name: "Dave", text: "斗图刷屏了", ts: "2025-01-13T10:01:00.000Z" },
+                { id: "w2_m2", userId: "onebot:103", name: "Carol", text: "Bob真是闲虫啊", ts: "2025-01-13T14:00:00.000Z" },
+                { id: "w2_m3", userId: "onebot:102", name: "Bob", text: "别叫我闲虫了，晚上开黑", ts: "2025-01-13T14:01:00.000Z" },
+            ]);
+
+            const lease = mem.acquireHistoryLease(chatId);
+            const job = mem.upsertHistoryJob({ kind: "initialize", chatId, inputKey: "synth-q", optionsJson: "{}", status: "running" }, lease.ownerToken);
+            mem.upsertHistoryUnits(job.jobId, "cluster", [
+                { unitKey: "c_w1", ordinal: 0, inputJson: "{}" },
+                { unitKey: "c_w2_a", ordinal: 1, inputJson: "{}" },
+                { unitKey: "c_w2_b", ordinal: 2, inputJson: "{}" },
+            ], lease.ownerToken);
+
+            const eligibleAll = loadEligibleHistoryMessages(mem, chatId);
+            const commitTopic = (unitKey: string, hKey: string, label: string, msgs: typeof eligibleAll) =>
+                mem.commitHistoricalClusterUnit({
+                    jobId: job.jobId,
+                    ownerToken: lease.ownerToken,
+                    chatId,
+                    unitKey,
+                    expectedMessageIds: msgs.map(m => m.messageId),
+                    expectedDigest: computeMessagesDigest(toDigestFields(msgs)),
+                    topics: [{
+                        historyKey: hKey,
+                        label,
+                        summary: label,
+                        keyPoints: [label],
+                        participants: [...new Set(msgs.map(m => m.userId))],
+                        keywords: [label],
+                        messageIds: msgs.map(m => m.messageId),
+                        startedAt: msgs[0].timestamp,
+                        endedAt: msgs[msgs.length - 1].timestamp,
+                        sentiment: "neutral",
+                    }],
+                    coveredPairs: msgs.map(m => ({ messageId: m.messageId, topicHistoryKey: hKey })),
+                    outputJson: "{}",
+                }).topicIds[0];
+
+            const tW1 = commitTopic("c_w1", "ht:w1", "W1话题", eligibleAll.slice(0, 2));
+            const tW2a = commitTopic("c_w2_a", "ht:w2a", "W2话题A", eligibleAll.slice(2, 4));
+            const tW2b = commitTopic("c_w2_b", "ht:w2b", "W2话题B", eligibleAll.slice(4, 6));
+            mem.releaseHistoryLease(chatId, lease.ownerToken);
+
+            const capturedUserPrompts: string[] = [];
+            let synthCallIdx = 0;
+            const longObs = "群友在日常交流中经常以连续发图片和表情包的方式互相接龙斗图刷屏，互动节奏轻松随性并且持续时间较长，经常一刷就是几十条消息甚至刷满整个屏幕";
+            assert.ok(longObs.length > 60);
+
+            const llmCall: HistoryLlmCallFn = async (opts) => {
+                const userPrompt = opts.messages[1].content;
+                capturedUserPrompts.push(userPrompt);
+                synthCallIdx++;
+
+                // Call 1: Week 1 synthesis unit
+                if (synthCallIdx === 1) {
+                    return {
+                        content: JSON.stringify({
+                            groupUpdates: {
+                                description: "轻松互损的日常水群",
+                                communicationNorms: ["常用图片和表情包参与互动，发言简短", "暂无"],
+                                hotTopics: ["日常吐槽"],
+                                tabooTopics: ["暂无明确证据显示存在固定忌讳话题"],
+                                evidence: [{ topicId: tW1, messageIds: ["w1_m1", "w1_m2"] }],
+                            },
+                            memberProfiles: [
+                                {
+                                    userId: "onebot:101",
+                                    traits: [
+                                        { value: "常以表情包回应，发言简短", topicId: tW1, messageIds: ["w1_m1"] },
+                                        { value: "未知", topicId: tW1, messageIds: ["w1_m1"] },
+                                    ],
+                                    interests: [
+                                        { value: "喜欢接龙整活", topicId: tW1, messageIds: ["w1_m1"] },
+                                    ],
+                                    communicationStyle: { value: "简短直接", topicId: tW1, messageIds: ["w1_m1"] },
+                                    episodes: [
+                                        { summary: "暂无明显互动", sentiment: "neutral", significance: 2, topicId: tW1, messageIds: ["w1_m1"] },
+                                    ],
+                                },
+                                {
+                                    userId: "onebot:102",
+                                    traits: [{ value: "爱跟风复读接龙", topicId: tW1, messageIds: ["w1_m2"] }],
+                                    interests: [],
+                                },
+                            ],
+                            memes: [
+                                {
+                                    canonicalKey: "leaked-example",
+                                    term: "现充/闲虫",
+                                    meaning: "代指社交生活丰富的人",
+                                    originContext: "本批采样中仅出现昵称“Dave”，未见明确“现充/闲虫”玩梗发言，故仅作待观察项。",
+                                    usageBoundaries: "证据不足，不建议随意使用",
+                                    topicId: tW1,
+                                    messageIds: ["w1_m1"],
+                                },
+                                {
+                                    canonicalKey: "hedgehog-meme",
+                                    term: "扎老板的手",
+                                    meaning: "群内刷屏接龙的搞笑整活段子",
+                                    originContext: "群友复制整活文案互相调侃",
+                                    usageBoundaries: "不确定时不要用",
+                                    topicId: tW1,
+                                    messageIds: ["w1_m1", "w1_m2"],
+                                },
+                            ],
+                            groupObservations: [
+                                {
+                                    canonicalKey: "obs-w1-stickers",
+                                    content: longObs,
+                                    topicId: tW1,
+                                    messageIds: ["w1_m1", "w1_m2"],
+                                },
+                                {
+                                    canonicalKey: "obs-w1-placeholder",
+                                    content: "未发现明确的线下聚会计划",
+                                    topicId: tW1,
+                                    messageIds: ["w1_m1"],
+                                },
+                            ],
+                        }),
+                    };
+                }
+
+                // Call 2: Week 2 unit hits context_length_exceeded to test split-retry path!
+                if (synthCallIdx === 2) {
+                    throw new Error("context_length_exceeded");
+                }
+
+                // Call 3: Week 2 left split (tW2a, message w2_m1)
+                if (synthCallIdx === 3) {
+                    return {
+                        content: JSON.stringify({
+                            groupUpdates: {
+                                description: "尚无明确全群描述",
+                                communicationNorms: [
+                                    "常以图片和表情包参与互动，发言较简短", // paraphrase of W1 norm -> must be skipped!
+                                    "喜欢深夜复读接龙",
+                                ],
+                                tabooTopics: ["N/A"],
+                                evidence: [{ topicId: tW2a, messageIds: ["w2_m1"] }],
+                            },
+                            memberProfiles: [
+                                {
+                                    userId: "onebot:101",
+                                    traits: [
+                                        { value: "常用表情包回应，发言非常简短", topicId: tW2a, messageIds: ["w2_m1"] }, // paraphrase -> skip!
+                                        { value: "喜欢深夜斗图", topicId: tW2a, messageIds: ["w2_m1"] },
+                                    ],
+                                    interests: [
+                                        { value: "爱接龙整活", topicId: tW2a, messageIds: ["w2_m1"] }, // paraphrase -> skip!
+                                    ],
+                                    communicationStyle: { value: "暂无", topicId: tW2a, messageIds: ["w2_m1"] },
+                                },
+                            ],
+                            memes: [],
+                            groupObservations: [
+                                {
+                                    canonicalKey: "obs-w2-paraphrase-different-key",
+                                    content: "群友日常互动常以连续发图片和表情包互相接龙斗图刷屏，节奏轻松随性", // paraphrase of W1 obs -> skip at store!
+                                    topicId: tW2a,
+                                    messageIds: ["w2_m1", "w2_m1b"],
+                                },
+                            ],
+                        }),
+                    };
+                }
+
+                // Call 4: Week 2 right split (tW2b, messages w2_m2, w2_m3)
+                return {
+                    content: JSON.stringify({
+                        groupUpdates: {
+                            communicationNorms: [
+                                "喜欢在深夜里复读接龙", // paraphrase of left split norm -> skipped by mergeSynthesisOutputs!
+                                ...Array.from({ length: 15 }, (_, i) => `新规范_${i}_编号_${i * 10}`),
+                            ],
+                            evidence: [{ topicId: tW2b, messageIds: ["w2_m2", "w2_m3"] }],
+                        },
+                        memberProfiles: [],
+                        memes: [
+                            {
+                                canonicalKey: "partial-variant-meme",
+                                term: "现充 ｜ 闲虫", // "现充" unattested in w2_m2, "闲虫" attested -> trimmed to "闲虫"!
+                                meaning: "调侃群友社交丰富",
+                                usageBoundaries: "熟人开玩笑使用",
+                                topicId: tW2b,
+                                messageIds: ["w2_m2", "w2_m3"],
+                            },
+                            {
+                                canonicalKey: "placeholder-meaning-meme",
+                                term: "闲虫",
+                                meaning: "待观察，证据不足",
+                                usageBoundaries: "暂不使用",
+                                topicId: tW2b,
+                                messageIds: ["w2_m2"],
+                            },
+                        ],
+                        groupObservations: [
+                            {
+                                canonicalKey: "obs-w2-new",
+                                content: "Carol 习惯在午后主动发起游戏开黑邀约",
+                                topicId: tW2b,
+                                messageIds: ["w2_m2", "w2_m3"],
+                            },
+                        ],
+                    }),
+                };
+            };
+
+            await runHistoryInitializationWithMemory(mem, {
+                chatId,
+                stage: "synthesize",
+                config: makeTestConfig(),
+                llmCall,
+            });
+
+            // 1. Unit 1 prompt must omit "已有记录" when nothing is recorded yet; Unit 2 (both split calls) must include Unit 1 records!
+            assert.equal(capturedUserPrompts.length, 4);
+            assert.equal(capturedUserPrompts[0].includes("## 已有记录"), false);
+
+            for (const splitPrompt of [capturedUserPrompts[2], capturedUserPrompts[3]]) {
+                assert.ok(splitPrompt.includes("## 已有记录"));
+                assert.ok(splitPrompt.includes("轻松互损的日常水群"));
+                assert.ok(splitPrompt.includes("常用图片和表情包参与互动，发言简短"));
+                assert.ok(splitPrompt.includes("扎老板的手"));
+                assert.ok(splitPrompt.includes(longObs.slice(0, 59) + "…"));
+                assert.equal(splitPrompt.includes("跨群秘密暗号"), false, "Foreign chat facts must never appear in prompt");
+            }
+            // Left split (w2a) has onebot:101 but NOT onebot:102; right split (w2b) has onebot:103 only
+            assert.ok(capturedUserPrompts[2].includes("onebot:101"));
+            assert.equal(capturedUserPrompts[2].includes("onebot:102"), false);
+            assert.equal(capturedUserPrompts[3].includes("onebot:101"), false);
+
+            // 2. GroupModel checks: placeholder taboo/description dropped, existing norm kept, paraphrases skipped, cap <= 12 enforced
+            const gm = mem.getGroupModel(chatId)!;
+            assert.equal(gm.description, "轻松互损的日常水群");
+            assert.deepEqual(gm.tabooTopics, []);
+            assert.equal(gm.communicationNorms[0], "常用图片和表情包参与互动，发言简短");
+            assert.equal(gm.communicationNorms.some(n => n.includes("常以图片和表情包")), false, "Paraphrased norm must be skipped");
+            assert.equal(gm.communicationNorms.filter(n => n.includes("复读接龙")).length, 1, "Left/right split paraphrase must be deduped");
+            assert.ok(gm.communicationNorms.length <= 12, `communicationNorms cap <= 12, got ${gm.communicationNorms.length}`);
+
+            // 3. Member profile checks: placeholder values dropped, existing trait/interest kept, paraphrases skipped
+            const alice = mem.getProfilesForChat(chatId).find(p => p.userId === "onebot:101")!;
+            assert.deepEqual(alice.traits, ["常以表情包回应，发言简短", "喜欢深夜斗图"]);
+            assert.deepEqual(alice.interests, ["喜欢接龙整活"]);
+            assert.equal(alice.communicationStyle, "简短直接");
+            assert.equal(alice.recentEpisodes.length, 0, "Placeholder episode must be dropped");
+
+            // 4. Facts checks: evidence-less 现充/闲虫 dropped, 仙人掌扎老板的手 (usageBoundaries="不确定时不要用") kept,
+            //    trimmed "闲虫" kept, placeholder observations & paraphrased W2 observation skipped!
+            const facts = mem.listCoreFacts({ sourceChatId: chatId, includeAllHistory: true }).items;
+            const memes = facts.filter(f => f.category === "anecdote");
+            const observations = facts.filter(f => f.category === "general");
+
+            assert.equal(memes.length, 2);
+            assert.ok(memes.some(m => m.content.startsWith("[群梗: 扎老板的手]") && m.content.includes("使用边界: 不确定时不要用") && m.content.includes("使用情况: 导入的历史中 2 条消息、2 人用过")));
+            assert.ok(memes.some(m => m.content.startsWith("[群梗: 闲虫]") && m.content.includes("使用情况: 导入的历史中 2 条消息、2 人用过")));
+            assert.equal(memes.some(m => m.content.includes("现充")), false, "Unattested variant 现充 must be trimmed/dropped");
+
+            assert.equal(observations.length, 2, "Only W1 observation and genuinely new W2 observation should be stored");
+            assert.ok(observations.some(o => o.content === longObs));
+            assert.ok(observations.some(o => o.content.includes("Carol")));
+        } finally {
+            cleanupTestMemory(mem, "hist-synth-quality-guards");
+        }
+    });
+
+    it("17. splits the synthesis batch when the model output is cut off instead of asking for a repair", async () => {
+        assert.equal(looksTruncatedJson('{"a":[1,2]}'), false);
+        assert.equal(looksTruncatedJson('```json\n{"a":{"b":"}"}}\n```'), false);
+        assert.equal(looksTruncatedJson('{"a":[{"b":1},'), true);
+        assert.equal(looksTruncatedJson('{"a":"ends inside a string }'), true);
+        assert.equal(looksTruncatedJson('{"a":"escaped \\" quote, still open'), true);
+        assert.equal(looksTruncatedJson("no object here"), false);
+
+        const mem = createTestMemory("hist-output-truncated");
+        const chatId = "onebot:group:10017";
+        try {
+            const baseMs = Date.parse("2025-06-01T00:00:00.000Z");
+            seedMessages(mem, chatId, Array.from({ length: 24 }, (_, i) => ({
+                id: `tm_${String(i).padStart(2, "0")}`,
+                userId: i % 2 === 0 ? "onebot:111" : "onebot:222",
+                name: i % 2 === 0 ? "Alice" : "Bob",
+                text: `line ${i}`,
+                ts: new Date(baseMs + i * 10_000).toISOString(),
+            })));
+
+            const stages: string[] = [];
+            const llmCall: HistoryLlmCallFn = async (opts) => {
+                stages.push(opts.stage);
+                const user = String(opts.messages[1].content);
+                if (opts.stage === "cluster") {
+                    const ids = [...new Set([...user.matchAll(/\[(tm_\d+)\]/g)].map(m => m[1]))];
+                    return {
+                        content: JSON.stringify({
+                            topics: [
+                                { tempId: "t1", label: "Breakfast", messageIds: ids.slice(0, 12) },
+                                { tempId: "t2", label: "Late games", messageIds: ids.slice(12) },
+                            ],
+                        }),
+                    };
+                }
+                if (opts.stage === "summary") {
+                    const tempIds = [...user.matchAll(/### 话题 (\S+):/g)].map(m => m[1]);
+                    return {
+                        content: JSON.stringify({
+                            summaries: tempIds.map(tempId => ({ tempId, label: tempId, summary: "s", keyPoints: ["k"], keywords: ["w"], sentiment: "neutral" })),
+                        }),
+                    };
+                }
+                const topicIds = [...user.matchAll(/- topicId: (\S+)/g)].map(m => m[1]);
+                if (topicIds.length > 1) {
+                    // Two topics do not fit the output limit: the object never closes.
+                    return { content: '{"groupUpdates":{"evidence":[]},"memberProfiles":[],"memes":[{"term":"cut o' };
+                }
+                const msgIds = [...user.matchAll(/\[(tm_\d+)\] \(/g)].map(m => m[1]).slice(0, 2);
+                return {
+                    content: JSON.stringify({
+                        groupUpdates: { evidence: [] },
+                        memberProfiles: [],
+                        memes: [],
+                        groupObservations: [{
+                            canonicalKey: `obs-${topicIds[0]}`,
+                            content: msgIds[0] < "tm_12" ? "大家早上喜欢聊早餐吃什么" : "深夜经常约着组队打游戏",
+                            topicId: topicIds[0],
+                            messageIds: msgIds,
+                        }],
+                    }),
+                };
+            };
+
+            const res = await runHistoryInitializationWithMemory(mem, {
+                chatId,
+                mode: "full",
+                stage: "all",
+                config: makeTestConfig(),
+                llmCall,
+            });
+            assert.equal(res.processedSynthesisUnits, 1);
+            assert.equal(res.factsCommitted, 2);
+            assert.equal(stages.filter(st => st === "synthesis").length, 3, "one cut-off attempt, then one call per half");
+            assert.equal(stages.includes("repair"), false, "repeating a cut-off answer would only be cut off again");
+            assert.equal(mem.findLatestHistoryJob("initialize", chatId)?.status, "done");
+        } finally {
+            cleanupTestMemory(mem, "hist-output-truncated");
+        }
+    });
+
+    it("18. enforces meme recurrence, cross-variant meme dedup across units/splits/store, multi-sender observations, per-unit caps, and batch size 8", async () => {
+        assert.equal(DEFAULT_MAX_TOPICS_PER_BATCH, 8);
+        const mem = createTestMemory("hist-synth-recurrence-caps");
+        const chatId = "onebot:group:60018";
+        try {
+            // Seed messages covering:
+            // - one-off remark by one sender ("一次性吐槽")
+            // - meme used by 2 senders ("猫都不吃这罐头", "你是猫？", "只是在念稿")
+            // - meme used in 3 distinct messages by 1 sender ("三连复读梗")
+            // - blocked / recalled / system rows that must NOT count toward recurrence
+            // - wildcard-safe literal instr check ("%_" should not match normal text)
+            // - enough repeated memes + multi-sender observations across 2 ISO weeks to test caps & split merge
+            const rows: Array<{
+                id: string;
+                userId: string;
+                name: string;
+                text: string;
+                ts: string;
+                qceMeta?: Record<string, unknown>;
+                blocked?: boolean;
+            }> = [
+                // Week 1 (2025-W02)
+                { id: "r_oneoff", userId: "onebot:101", name: "Alice", text: "今天遇到一个一次性吐槽而已", ts: "2025-01-06T10:00:00.000Z" },
+                { id: "r_oneoff_blk", userId: "onebot:102", name: "Bob", text: "一次性吐槽", ts: "2025-01-06T10:00:10.000Z", blocked: true },
+                { id: "r_oneoff_rec", userId: "onebot:103", name: "Carol", text: "一次性吐槽", ts: "2025-01-06T10:00:20.000Z", qceMeta: { recalled: true } },
+                { id: "r_oneoff_sys", userId: "system", name: "System", text: "一次性吐槽", ts: "2025-01-06T10:00:30.000Z" },
+                { id: "r_dog1", userId: "onebot:101", name: "Alice", text: "猫都不吃这罐头", ts: "2025-01-06T10:01:00.000Z" },
+                { id: "r_dog2", userId: "onebot:102", name: "Bob", text: "你是猫？只是在念稿", ts: "2025-01-06T10:02:00.000Z" },
+                { id: "r_tri1", userId: "onebot:103", name: "Carol", text: "三连复读梗 启动", ts: "2025-01-06T10:03:00.000Z" },
+                { id: "r_tri2", userId: "onebot:103", name: "Carol", text: "三连复读梗 继续", ts: "2025-01-06T10:04:00.000Z" },
+                { id: "r_tri3", userId: "onebot:103", name: "Carol", text: "三连复读梗 结束", ts: "2025-01-06T10:05:00.000Z" },
+                // Week 2 (2025-W03): two topics for split-merge testing (shared-variant memes + cap >6 memes / >3 obs)
+                { id: "w2_a1", userId: "onebot:101", name: "Alice", text: "猫都不吃这罐头 确实; 共享半边梗 左半变体 梗A1 梗A2 梗A3 梗A4", ts: "2025-01-13T10:00:00.000Z" },
+                { id: "w2_a2", userId: "onebot:102", name: "Bob", text: "共享半边梗 左半变体 梗A1 梗A2 梗A3 梗A4", ts: "2025-01-13T10:01:00.000Z" },
+                { id: "w2_b1", userId: "onebot:101", name: "Alice", text: "你是猫？哈哈; 共享半边梗 右半变体 梗B1 梗B2 梗B3 梗B4", ts: "2025-01-13T12:00:00.000Z" },
+                { id: "w2_b2", userId: "onebot:102", name: "Bob", text: "共享半边梗 右半变体 梗B1 梗B2 梗B3 梗B4", ts: "2025-01-13T12:01:00.000Z" },
+            ];
+            seedMessages(mem, chatId, rows);
+
+            // Verify countChatMemeVariantUsage SQL eligibility, <2 char skip, and literal instr (no LIKE wildcard expansion)
+            assert.deepEqual(mem.countChatMemeVariantUsage(chatId, ["一次性吐槽"]), { messageCount: 1, senderCount: 1 });
+            assert.deepEqual(mem.countChatMemeVariantUsage(chatId, ["一", "三"]), { messageCount: 0, senderCount: 0 });
+            assert.deepEqual(mem.countChatMemeVariantUsage(chatId, ["%_", "___"]), { messageCount: 0, senderCount: 0 });
+            assert.deepEqual(mem.countChatMemeVariantUsage(chatId, ["三连复读梗"]), { messageCount: 3, senderCount: 1 });
+
+            // Commit 1 topic in W1 and 2 topics in W2 (plus verify 9 topics in W3 batch into 8 + 1)
+            const lease = mem.acquireHistoryLease(chatId);
+            const job = mem.upsertHistoryJob({ kind: "initialize", chatId, inputKey: "rec-test", optionsJson: "{}", status: "running" }, lease.ownerToken);
+            const eligible = loadEligibleHistoryMessages(mem, chatId);
+            const byId = new Map(eligible.map(m => [m.messageId, m]));
+
+            const commitCluster = (unitKey: string, hKey: string, label: string, ids: string[]) => {
+                const msgs = ids.map(id => byId.get(id)!);
+                mem.upsertHistoryUnits(job.jobId, "cluster", [{ unitKey, ordinal: 0, inputJson: "{}" }], lease.ownerToken);
+                return mem.commitHistoricalClusterUnit({
+                    jobId: job.jobId,
+                    ownerToken: lease.ownerToken,
+                    chatId,
+                    unitKey,
+                    expectedMessageIds: ids,
+                    expectedDigest: computeMessagesDigest(toDigestFields(msgs)),
+                    topics: [{
+                        historyKey: hKey,
+                        label,
+                        summary: label,
+                        keyPoints: [label],
+                        participants: [...new Set(msgs.map(m => m.userId))],
+                        keywords: [label],
+                        messageIds: ids,
+                        startedAt: msgs[0].timestamp,
+                        endedAt: msgs[msgs.length - 1].timestamp,
+                        sentiment: "neutral",
+                    }],
+                    coveredPairs: ids.map(id => ({ messageId: id, topicHistoryKey: hKey })),
+                    outputJson: "{}",
+                }).topicIds[0];
+            };
+
+            const tW1 = commitCluster("cu1", "ht:r1", "W1", ["r_oneoff", "r_dog1", "r_dog2", "r_tri1", "r_tri2", "r_tri3"]);
+            const tW2a = commitCluster("cu2a", "ht:r2a", "W2A", ["w2_a1", "w2_a2"]);
+            const tW2b = commitCluster("cu2b", "ht:r2b", "W2B", ["w2_b1", "w2_b2"]);
+            mem.releaseHistoryLease(chatId, lease.ownerToken);
+
+            // Check batching splits 9 topics into 8 + 1
+            const syntheticNineTopics = Array.from({ length: 9 }, (_, i) => ({
+                ...mem.getHistoricalTopicsForChat(chatId)[0],
+                id: `batch_t_${i}`,
+                historyKey: `ht:b:${i}`,
+                startedAt: `2025-02-03T10:0${i}:00.000Z`,
+                endedAt: `2025-02-03T10:0${i}:30.000Z`,
+            }));
+            const nineBatches = buildSynthesisMacroBatches(syntheticNineTopics, mem, { chatId });
+            assert.deepEqual(nineBatches.batches.map(b => b.topics.length), [8, 1]);
+
+            let callCount = 0;
+            const llmCall: HistoryLlmCallFn = async (opts) => {
+                callCount++;
+                const user = opts.messages[1].content;
+                // Unit 1 (W1): proposes one-off (dropped), 2-sender meme (kept), 3-msg single-sender meme (kept),
+                // 1-sender observation (dropped), 2-sender observation (kept)
+                if (callCount === 1) {
+                    return {
+                        content: JSON.stringify({
+                            groupUpdates: { evidence: [] },
+                            memberProfiles: [],
+                            memes: [
+                                {
+                                    canonicalKey: "oneoff",
+                                    term: "一次性吐槽",
+                                    meaning: "只出现一次的随口吐槽",
+                                    usageBoundaries: "不应收录",
+                                    topicId: tW1,
+                                    messageIds: ["r_oneoff"],
+                                },
+                                {
+                                    canonicalKey: "dog-w1",
+                                    term: "猫都不吃这罐头 / 你是猫？",
+                                    meaning: "群友对特定游戏模式的调侃接梗",
+                                    usageBoundaries: "熟人调侃时使用",
+                                    topicId: tW1,
+                                    messageIds: ["r_dog1", "r_dog2"],
+                                },
+                                {
+                                    canonicalKey: "triple-w1",
+                                    term: "三连复读梗",
+                                    meaning: "单人连续刷屏三次的复读梗",
+                                    usageBoundaries: "玩梗刷屏时谨慎跟随",
+                                    topicId: tW1,
+                                    messageIds: ["r_tri1", "r_tri2", "r_tri3"],
+                                },
+                            ],
+                            groupObservations: [
+                                {
+                                    canonicalKey: "single-sender-obs",
+                                    content: "Carol 喜欢自己连续发三次消息",
+                                    topicId: tW1,
+                                    messageIds: ["r_tri1", "r_tri2", "r_tri3"], // single sender! -> dropped
+                                },
+                                {
+                                    canonicalKey: "two-sender-obs",
+                                    content: "群友之间常互相接茬玩游戏梗",
+                                    topicId: tW1,
+                                    messageIds: ["r_dog1", "r_dog2"], // 2 distinct senders -> kept
+                                },
+                            ],
+                        }),
+                    };
+                }
+
+                // Unit 2 (W2): trigger split via truncation / context error
+                if (callCount === 2) {
+                    throw new Error("context_length_exceeded");
+                }
+
+                // Unit 2 left split (tW2a): tries overlapping meme with W1 ("猫都不吃这罐头") + 4 new memes + 2 obs
+                if (user.includes(tW2a)) {
+                    return {
+                        content: JSON.stringify({
+                            groupUpdates: { evidence: [] },
+                            memberProfiles: [],
+                            memes: [
+                                {
+                                    canonicalKey: "dog-w2a-dup",
+                                    term: "猫都不吃这罐头 / 梗A1", // shares "猫都不吃这罐头" with W1 -> skipped!
+                                    meaning: "重复梗",
+                                    usageBoundaries: "测试",
+                                    topicId: tW2a,
+                                    messageIds: ["w2_a1", "w2_a2"],
+                                },
+                                {
+                                    canonicalKey: "split-shared-left",
+                                    term: "共享半边梗 / 左半变体",
+                                    meaning: "左半边先提出的共享梗",
+                                    usageBoundaries: "测试",
+                                    topicId: tW2a,
+                                    messageIds: ["w2_a1", "w2_a2"],
+                                },
+                                ...["梗A1", "梗A2", "梗A3"].map(term => ({
+                                    canonicalKey: `k_${term}`,
+                                    term,
+                                    meaning: `${term} 含义`,
+                                    usageBoundaries: "测试边界",
+                                    topicId: tW2a,
+                                    messageIds: ["w2_a1", "w2_a2"],
+                                })),
+                            ],
+                            groupObservations: [
+                                { canonicalKey: "obs_l1", content: "群友早上经常同步上线打招呼", topicId: tW2a, messageIds: ["w2_a1", "w2_a2"] },
+                                { canonicalKey: "obs_l2", content: "群里回复速度普遍较快且偏简短", topicId: tW2a, messageIds: ["w2_a1", "w2_a2"] },
+                            ],
+                        }),
+                    };
+                }
+
+                // Unit 2 right split (tW2b): tries overlapping meme with W1 ("你是猫？") + 4 new memes + 2 obs
+                // Merged W2 result has 4 (left) + 4 (right) = 8 memes -> capped at 6; 2 + 2 = 4 obs -> capped at 3!
+                return {
+                    content: JSON.stringify({
+                        groupUpdates: { evidence: [] },
+                        memberProfiles: [],
+                        memes: [
+                            {
+                                canonicalKey: "dog-w2b-dup",
+                                term: "你是猫？", // shares variant with W1 -> skipped!
+                                meaning: "重复梗",
+                                usageBoundaries: "测试",
+                                topicId: tW2b,
+                                messageIds: ["w2_b1", "w2_b2"],
+                            },
+                            {
+                                canonicalKey: "split-shared-right",
+                                term: "共享半边梗 / 右半变体", // shares "共享半边梗" with left split half -> skipped in mergeSynthesisOutputs!
+                                meaning: "右半边重复的共享梗",
+                                usageBoundaries: "测试",
+                                topicId: tW2b,
+                                messageIds: ["w2_b1", "w2_b2"],
+                            },
+                            ...["梗B1", "梗B2", "梗B3", "梗B4"].map(term => ({
+                                canonicalKey: `k_${term}`,
+                                term,
+                                meaning: `${term} 含义`,
+                                usageBoundaries: "测试边界",
+                                topicId: tW2b,
+                                messageIds: ["w2_b1", "w2_b2"],
+                            })),
+                        ],
+                        groupObservations: [
+                            { canonicalKey: "obs_r1", content: "午间讨论游戏配队时气氛比较活跃", topicId: tW2b, messageIds: ["w2_b1", "w2_b2"] },
+                            { canonicalKey: "obs_r2", content: "群友喜欢在午休时段连续刷图互动", topicId: tW2b, messageIds: ["w2_b1", "w2_b2"] },
+                        ],
+                    }),
+                };
+            };
+
+            await runHistoryInitializationWithMemory(mem, {
+                chatId,
+                stage: "synthesize",
+                config: makeTestConfig(),
+                llmCall,
+            });
+
+            const facts = mem.listCoreFacts({ sourceChatId: chatId, includeAllHistory: true }).items;
+            const memes = facts.filter(f => f.category === "anecdote");
+            const observations = facts.filter(f => f.category === "general");
+
+            // W1: 2 memes ("猫都不吃这罐头 / 你是猫？" & "三连复读梗"), one-off dropped;
+            // W2: 4 (left: 共享半边梗+A1..A3) + 4 (right: B1..B4, with 共享半边梗/右半变体 deduped) capped at 6 -> total 8 memes!
+            assert.equal(memes.length, 8);
+            assert.equal(memes.some(m => m.content.includes("一次性吐槽")), false, "One-off meme must be dropped");
+            assert.equal(memes.filter(m => m.content.includes("共享半边梗")).length, 1, "Shared meme variant across split halves must dedupe");
+            assert.equal(memes.some(m => m.content.includes("右半变体")), false);
+
+            const dogMeme = memes.find(m => m.content.startsWith("[群梗: 猫都不吃这罐头 / 你是猫？]"))!;
+            assert.ok(dogMeme);
+            assert.ok(dogMeme.content.includes("使用情况: 导入的历史中 4 条消息、2 人用过"));
+
+            const tripleMeme = memes.find(m => m.content.startsWith("[群梗: 三连复读梗]"))!;
+            assert.ok(tripleMeme);
+            assert.ok(tripleMeme.content.includes("使用情况: 导入的历史中 3 条消息、1 人用过"));
+
+            // Observations: W1 had 1 valid (single-sender dropped), W2 split merged 4 -> capped at 3 -> total 4!
+            assert.equal(observations.length, 4);
+            assert.equal(observations.some(o => o.content.includes("Carol")), false, "Single-sender observation must be dropped");
+            assert.equal(observations.some(o => o.content.includes("午休时段")), false, "Merged W2 observations must be capped at 3");
+
+            // Store-level commit dedup: direct commitHistoricalSynthesisUnit with overlapping normalized meme variant is skipped
+            const lStore = mem.acquireHistoryLease(chatId);
+            const jStore = mem.upsertHistoryJob({ kind: "initialize", chatId, inputKey: "store-dedup", optionsJson: "{}", status: "running" }, lStore.ownerToken);
+            mem.upsertHistoryUnits(jStore.jobId, "synthesize", [{ unitKey: "sd1", ordinal: 0, inputJson: "{}" }], lStore.ownerToken);
+            const storeRes = mem.commitHistoricalSynthesisUnit({
+                jobId: jStore.jobId,
+                ownerToken: lStore.ownerToken,
+                chatId,
+                unitKey: "sd1",
+                rankKey: "2025-W04#0000",
+                memberPatches: [],
+                factProposals: [{
+                    historyKey: "hist_meme:brand-new-key-overlap",
+                    subject: `group:${chatId}`,
+                    content: "[群梗: 猫都不吃这罐头 / 全新变体]；真实含义: 重复；使用边界: 测；使用情况: 导入的历史中 2 条消息、2 人用过",
+                    category: "anecdote",
+                    sourceTopicId: tW1,
+                    sourceMessageIds: ["r_dog1", "r_dog2"],
+                    observedAt: "2025-01-06T10:02:00.000Z",
+                }],
+                outputJson: "{}",
+                isPrivateOrSensitive: false,
+            });
+            mem.releaseHistoryLease(chatId, lStore.ownerToken);
+            assert.equal(storeRes.factsCommitted, 0, "Store commit must also reject overlapping meme variant");
+        } finally {
+            cleanupTestMemory(mem, "hist-synth-recurrence-caps");
+        }
     });
 });

@@ -16,6 +16,12 @@ import { loadPromptFile } from "../core/prompt-loader.js";
 import { getGlobalTimezone } from "../core/timezone.js";
 import { embed } from "../memory-v2/embedding.js";
 import {
+    MAX_GROUP_HOT_TOPICS_SEED_ITEMS,
+    MAX_GROUP_NORMS_SEED_ITEMS,
+    MAX_GROUP_TABOO_TOPICS_SEED_ITEMS,
+    MAX_MEMBER_INTERESTS_SEED_ITEMS,
+    MAX_MEMBER_TRAITS_SEED_ITEMS,
+    MIN_MEME_RECURRENCE_VARIANT_CHARS,
     NEWCOMER_AGENT_ROLE,
     computeEmbeddingContentHash,
     type HistorySynthesisCitation,
@@ -25,6 +31,16 @@ import {
     type HistorySynthesisMemberPatch,
     type HistoryUnitInput,
 } from "../memory-v2/history-store.js";
+import {
+    MEME_VARIANT_SPLIT_RE,
+    extractMemeTermFromFactContent,
+    extractNormalizedMemeVariants,
+    hasOverlappingMemeVariant,
+    isNearDuplicateText,
+    mergeStringsNearDedupe,
+    normalizeForComparison,
+    toCharBigramSet,
+} from "../memory-v2/text-similarity.js";
 import type { MemoryStoreV2 } from "../memory-v2/memory-v2.js";
 import type { TopicNode } from "../memory-v2/types.js";
 import { HistoryUsageError } from "./errors.js";
@@ -32,6 +48,7 @@ import { dryRunQceImport, importQce, type QceImportOptions, type QceImportSummar
 import { openSqliteReadOnlyStrict } from "./sqlite-readonly.js";
 import { assertValidIanaTimezone, parseStrictTimestampMs } from "./time-utils.js";
 import {
+    DEFAULT_MAX_TOPICS_PER_BATCH,
     DEFAULT_MIN_WINDOW_MESSAGES,
     buildHistoryWindows,
     buildSynthesisMacroBatches,
@@ -145,10 +162,14 @@ const FALLBACK_SUMMARY_PROMPT = `你是一个离线历史话题摘要助手。�
 只输出严格 JSON：{"summaries":[{"tempId":"t1","label":"标签","summary":"摘要","keyPoints":["要点"],"keywords":["词"],"sentiment":"neutral"}]}`;
 
 const FALLBACK_SYNTHESIS_SYSTEM_PROMPT = `你是新入群观察者，正在离线学习群文化、群梗/黑话与成员特征。
-严格区分玩笑/反讽与真实个人事实：调侃与黑话只能进入 memes（写明真实含义与使用边界），绝不写入 biographical/personalClaims。
+严格区分玩笑/反讽与真实个人事实：调侃、外号、谐音、反话、复读接龙等黑话只能进入 memes（写明真实含义与使用边界），绝不写入 biographical/personalClaims。
+没有明确消息证据时直接省略条目，绝不输出“待观察”“证据不足”“暂无”“尚无”“无明显”等占位说明，无内容时列表输出 []；tabooTopics 仅在消息中出现真实冲突或明确回避时填写。
+memes 只收录群内反复出现（多人使用或多次出现）的真实群梗，不要收录单人一次性吐槽或只发过一次的长段子；term 必须是所引用消息原文出现过的表达，多个变体用 / 分隔且每个变体都必须在引用消息原文中出现过。
+groupObservations 必须总结跨多名成员成立的群体习惯或互动规律（引用至少 2 名不同发言者的消息），不要把单次对话复述成固定习惯。每批最多输出 3 条 groupObservations 与 6 条 memes，绝大多数批次应更少。
+若输入包含「已有记录」，不得重复或换一种说法改写已记录内容；description 仅在当前为空或需以更好的全群整体概括替换时才输出。
 严禁输出任何 relationToAgent、dunbarTier、affinityScore。每条结论必须引用输入中的 topicId 和 messageIds。只输出严格 JSON。`;
 
-const FALLBACK_SYNTHESIS_USER_PROMPT = `请根据以上历史话题与采样消息，输出严格 JSON：
+const FALLBACK_SYNTHESIS_USER_PROMPT = `请根据以上历史话题与采样消息，提炼新增或需修正的内容（无证据则省略，勿输出占位文本，勿重复已有记录；每批最多 3 条观察、6 条群梗，绝大多数批次应更少），输出严格 JSON：
 {"groupUpdates":{"description":"","dominantLanguage":"","engagementLevel":"medium","communicationNorms":[],"hotTopics":[],"tabooTopics":[],"evidence":[]},"memberProfiles":[],"memes":[],"groupObservations":[]}`;
 
 function createAbortError(): Error {
@@ -188,8 +209,20 @@ function isTimeoutError(err: unknown): boolean {
         || msg.includes("timeout");
 }
 
+/**
+ * The model ran into its output limit mid-JSON. Asking it to repeat the whole
+ * object would truncate again; the unit has to be split so each part fits.
+ */
+export class HistoryOutputTruncatedError extends Error {
+    constructor(stage: string, outputChars: number) {
+        super(`Model output was cut off before the JSON object closed (stage=${stage}, ${outputChars} chars)`);
+        this.name = "HistoryOutputTruncatedError";
+    }
+}
+
 export function classifyHistoryLlmError(err: unknown): HistoryLlmErrorClass {
     if (!(err instanceof Error)) return "other";
+    if (err instanceof HistoryOutputTruncatedError) return "size_reducible";
     if (isTimeoutError(err)) return "size_reducible";
     if (isAbortError(err)) return "abort";
 
@@ -396,6 +429,32 @@ function stripJsonFences(raw: string): string {
     return raw.trim().replace(/^```(?:json)?[ \t]*\r?\n?/i, "").replace(/\r?\n?```[ \t]*$/i, "").trim();
 }
 
+/** True when the first JSON object in `raw` never closes: cut off inside a string or with open braces/brackets. */
+export function looksTruncatedJson(raw: string): boolean {
+    const text = stripJsonFences(raw);
+    const start = text.indexOf("{");
+    if (start < 0) return false;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (ch === "\\") escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') inString = true;
+        else if (ch === "{" || ch === "[") depth++;
+        else if (ch === "}" || ch === "]") {
+            depth--;
+            if (depth === 0) return false;
+        }
+    }
+    return true;
+}
+
 function extractTopLevelJsonObject(raw: string): Record<string, unknown> {
     const stripped = stripJsonFences(raw);
     const tryParseObj = (candidate: string): Record<string, unknown> | null => {
@@ -413,9 +472,12 @@ function extractTopLevelJsonObject(raw: string): Record<string, unknown> {
         const firstBrace = stripped.indexOf("{");
         const lastBrace = stripped.lastIndexOf("}");
         if (firstBrace >= 0 && lastBrace > firstBrace) {
-            const slice = stripped.slice(firstBrace, lastBrace + 1);
-            const obj = tryParseObj(slice);
-            if (obj) return obj;
+            try {
+                const obj = tryParseObj(stripped.slice(firstBrace, lastBrace + 1));
+                if (obj) return obj;
+            } catch {
+                // fall through to the uniform error below
+            }
         }
         throw new Error(`Malformed JSON output: ${stripped.slice(0, 160)}`);
     }
@@ -770,7 +832,7 @@ function inspectHistoryDryRunReadOnly(params: {
     let estimatedSynthesisUnits = 0;
     if (runSynthesizeStage) {
         if (storedTopicCount > 0) {
-            estimatedSynthesisUnits = Math.max(1, Math.ceil(storedTopicCount / 24));
+            estimatedSynthesisUnits = Math.max(1, Math.ceil(storedTopicCount / DEFAULT_MAX_TOPICS_PER_BATCH));
         } else if (runClusterStage && plannedClusterUnits > 0) {
             estimatedSynthesisUnits = Math.max(1, Math.ceil(plannedClusterUnits / 6));
         }
@@ -1503,6 +1565,9 @@ async function callLlmWithRateLimitBackoff<T>(
         const obj = extractTopLevelJsonObject(firstRaw);
         return { parsed: params.validate(obj), rawContent: firstRaw };
     } catch (parseErr) {
+        if (looksTruncatedJson(firstRaw)) {
+            throw new HistoryOutputTruncatedError(params.stage, firstRaw.length);
+        }
         // Bounded ONE schema-repair retry (with point-of-use privacy recheck!)
         const repairMessages: ChatMessage[] = [
             ...params.messages,
@@ -1514,7 +1579,15 @@ async function callLlmWithRateLimitBackoff<T>(
             },
         ];
         const repairedRaw = await invokeWithBackoff(repairMessages, "repair");
-        const obj = extractTopLevelJsonObject(repairedRaw);
+        let obj: Record<string, unknown>;
+        try {
+            obj = extractTopLevelJsonObject(repairedRaw);
+        } catch (repairErr) {
+            if (looksTruncatedJson(repairedRaw)) {
+                throw new HistoryOutputTruncatedError("repair", repairedRaw.length);
+            }
+            throw repairErr;
+        }
         return { parsed: params.validate(obj), rawContent: repairedRaw };
     }
 }
@@ -1896,14 +1969,119 @@ interface SynthesisUnitOutput {
 }
 
 const BOT_RELATIONSHIP_CLAIM_RE = /(?:与|和|跟)\s*(?:ai助手|bot|ai|机器人|助手|我)\s*(?:很熟|非常熟|关系很?好|是好?友|是死党|是闺蜜|是挚友|认识很久|私交|聊过很多)|(?:ai助手|bot|ai|机器人|助手)\s*的\s*(?:好友|朋友|死党|挚友|闺蜜|老熟人)|(?:relationToAgent|dunbarTier|affinityScore)/i;
-const SARCASTIC_BANTER_CLAIM_RE = /(?:是|真[是的]|简直是|外号叫|自称)\s*(?:个|一位|大)?\s*(?:现充|闲虫|女装大佬|男娘|富婆|海王|舔狗|0\b)|(?:反讽|玩梗|起外号|你是\s*猫)/i;
+// Only label-style assertions ("X 是个…") are refused here. Text that merely describes a
+// joking style ("爱玩梗", "常用反讽") is a legitimate trait and must not be dropped.
+const SARCASTIC_BANTER_CLAIM_RE = /(?:是|真[是的]|简直是|外号叫|自称)\s*(?:个|一位|大)?\s*(?:现充|闲虫|女装大佬|男娘|富婆|海王|舔狗|0\b)/i;
 const PERSONAL_BIOGRAPHY_CLAIM_RE = /(?:今年\s*\d+\s*岁|毕业于|就职于|在.{1,20}(?:公司|大学|学校|医院)?(?:工作|上班|上学|读书)|是.{1,15}(?:工程师|程序员|医生|老师|学生|老板)|家住|真名叫|身份证|手机号|住在.{1,20}(?:市|区|省)|已婚|离异|月薪|年薪)/i;
+
+const PLACEHOLDER_EXACT_RE = /^(?:暂无|尚无|无|未知|不详|没有|未提及|未见|空|none|null|n\/a|na|nil|unknown|tbd)$/i;
+const PLACEHOLDER_PREFIX_RE = /^(?:暂无|尚无|无明显|无明确|未发现|未见|没有发现|没有明确|没有明显|暂未发现|暂未见|目前暂无|目前尚无|目前无|当前暂无|当前无|本批未|未观察到|未体现|无法判断|难以判断|暂无法)/i;
+const PLACEHOLDER_CONTAINS_RE = /(?:证据不足|待观察|未见明确|暂无明确|尚不明确|无法确定|本批采样中|仅作待观察|无法确认|信息不足以|不足以判断|缺乏明确证据|暂无相关|无明确证据|没有足够证据|尚无明确)/i;
+
+const MEME_ATTESTATION_BIGRAM_THRESHOLD = 0.6;
+export const MIN_MEME_RECURRENCE_SENDERS = 2;
+export const MIN_MEME_RECURRENCE_MESSAGES = 3;
+export const MIN_OBSERVATION_DISTINCT_SENDERS = 2;
+export const MAX_MEMES_PER_SYNTHESIS_UNIT = 6;
+export const MAX_OBSERVATIONS_PER_SYNTHESIS_UNIT = 3;
+const MAX_RECORDED_MEMES_IN_PROMPT = 80;
+const MAX_RECORDED_OBSERVATIONS_IN_PROMPT = 40;
+const MAX_OBSERVATION_PREVIEW_CHARS = 60;
+const MAX_RECORDED_MEMBERS_IN_PROMPT = 30;
+const MAX_RECORDED_MEMBER_LIST_IN_PROMPT = 8;
+
+export function isPlaceholderSynthesisText(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) return true;
+    const strippedExact = trimmed.replace(/^[\s"'“”‘’()（）[\]【】<>《》]+|[\s"'“”‘’()（）[\]【】<>《》。.!！?？;；,，、]+$/g, "");
+    if (!strippedExact || PLACEHOLDER_EXACT_RE.test(strippedExact)) return true;
+    if (PLACEHOLDER_PREFIX_RE.test(trimmed)) return true;
+    if (PLACEHOLDER_CONTAINS_RE.test(trimmed)) return true;
+    return false;
+}
+
+export function attestMemeTerm(rawTerm: string, citedTexts: readonly string[]): string | null {
+    const variants = rawTerm
+        .split(MEME_VARIANT_SPLIT_RE)
+        .map(v => v.trim())
+        .filter(Boolean);
+    if (variants.length === 0) return null;
+
+    const normalizedCitedTexts = citedTexts
+        .map(t => normalizeForComparison(t))
+        .filter(Boolean);
+    if (normalizedCitedTexts.length === 0) return null;
+
+    const citedBigramPool = new Set<string>();
+    for (const normText of normalizedCitedTexts) {
+        for (const bg of toCharBigramSet(normText)) {
+            citedBigramPool.add(bg);
+        }
+    }
+
+    const attested: string[] = [];
+    const seenNormalized = new Set<string>();
+    for (const variant of variants) {
+        const normVariant = normalizeForComparison(variant);
+        if (!normVariant || seenNormalized.has(normVariant)) continue;
+
+        let isAttested = normalizedCitedTexts.some(msg => msg.includes(normVariant));
+        if (!isAttested && Array.from(normVariant).length >= 4) {
+            const variantBigrams = toCharBigramSet(normVariant);
+            if (variantBigrams.size > 0) {
+                let hits = 0;
+                for (const bg of variantBigrams) {
+                    if (citedBigramPool.has(bg)) hits++;
+                }
+                if (hits / variantBigrams.size >= MEME_ATTESTATION_BIGRAM_THRESHOLD) {
+                    isAttested = true;
+                }
+            }
+        }
+
+        if (isAttested) {
+            seenNormalized.add(normVariant);
+            attested.push(variant);
+        }
+    }
+
+    return attested.length > 0 ? attested.join(" / ") : null;
+}
+
+function loadStoredNormalizedMemeVariants(memory: MemoryStoreV2, chatId: string): Set<string> {
+    const known = new Set<string>();
+    const PAGE_SIZE = 200;
+    let offset = 0;
+    while (true) {
+        const page = memory.listCoreFacts({
+            subject: `group:${chatId}`,
+            category: "anecdote",
+            sourceChatId: chatId,
+            authorizedChatId: chatId,
+            includeAllHistory: false,
+            limit: PAGE_SIZE,
+            offset,
+        });
+        for (const f of page.items) {
+            if (!f.historyKey) continue;
+            const term = extractMemeTermFromFactContent(f.content);
+            if (!term) continue;
+            for (const v of extractNormalizedMemeVariants(term)) {
+                known.add(v);
+            }
+        }
+        offset += page.items.length;
+        if (page.items.length < PAGE_SIZE || offset >= page.total) break;
+    }
+    return known;
+}
 
 function isDisallowedSynthesisClaim(
     text: string,
     kind: "trait" | "interest" | "style" | "episode" | "observation",
 ): boolean {
     if (!text) return true;
+    if (isPlaceholderSynthesisText(text)) return true;
     if (BOT_RELATIONSHIP_CLAIM_RE.test(text)) return true;
     if (kind !== "interest" && SARCASTIC_BANTER_CLAIM_RE.test(text)) {
         return true;
@@ -1912,6 +2090,105 @@ function isDisallowedSynthesisClaim(
         return true;
     }
     return false;
+}
+
+function buildAlreadyRecordedSection(
+    chatId: string,
+    topicBlocks: readonly SynthesisTopicBlock[],
+    memory: MemoryStoreV2,
+    groupModel: ReturnType<MemoryStoreV2["getGroupModel"]>,
+): string | null {
+    const lines: string[] = [];
+
+    const desc = groupModel?.description?.trim();
+    const norms = (groupModel?.communicationNorms ?? []).map(s => s.trim()).filter(Boolean);
+    const hots = (groupModel?.hotTopics ?? []).map(s => s.trim()).filter(Boolean);
+    const taboos = (groupModel?.tabooTopics ?? []).map(s => s.trim()).filter(Boolean);
+    if (desc) lines.push(`- 群描述: ${desc}`);
+    if (norms.length > 0) lines.push(`- 沟通规范: ${norms.join("；")}`);
+    if (hots.length > 0) lines.push(`- 热门话题: ${hots.join("；")}`);
+    if (taboos.length > 0) lines.push(`- 禁忌话题: ${taboos.join("；")}`);
+
+    const memeFacts = memory.listCoreFacts({
+        subject: `group:${chatId}`,
+        category: "anecdote",
+        sourceChatId: chatId,
+        authorizedChatId: chatId,
+        includeAllHistory: false,
+        limit: MAX_RECORDED_MEMES_IN_PROMPT,
+    }).items;
+    const memeTerms: string[] = [];
+    const seenMemeTerms = new Set<string>();
+    for (const f of memeFacts) {
+        if (!f.historyKey) continue;
+        const term = extractMemeTermFromFactContent(f.content);
+        if (term && !seenMemeTerms.has(term)) {
+            seenMemeTerms.add(term);
+            memeTerms.push(term);
+            if (memeTerms.length >= MAX_RECORDED_MEMES_IN_PROMPT) break;
+        }
+    }
+    if (memeTerms.length > 0) {
+        lines.push(`- 已记录群梗 (${memeTerms.length}): ${memeTerms.join("；")}`);
+    }
+
+    const obsFacts = memory.listCoreFacts({
+        subject: `group:${chatId}`,
+        category: "general",
+        sourceChatId: chatId,
+        authorizedChatId: chatId,
+        includeAllHistory: false,
+        limit: MAX_RECORDED_OBSERVATIONS_IN_PROMPT,
+    }).items;
+    const obsSummaries: string[] = [];
+    for (const f of obsFacts) {
+        if (!f.historyKey) continue;
+        const clean = f.content.replace(/\s+/g, " ").trim();
+        if (!clean) continue;
+        obsSummaries.push(
+            clean.length > MAX_OBSERVATION_PREVIEW_CHARS
+                ? `${clean.slice(0, MAX_OBSERVATION_PREVIEW_CHARS - 1)}…`
+                : clean,
+        );
+        if (obsSummaries.length >= MAX_RECORDED_OBSERVATIONS_IN_PROMPT) break;
+    }
+    if (obsSummaries.length > 0) {
+        lines.push(`- 已记录群聊观察 (${obsSummaries.length}):`);
+        for (const summary of obsSummaries) {
+            lines.push(`  - ${summary}`);
+        }
+    }
+
+    const batchParticipants = new Set<string>();
+    for (const block of topicBlocks) {
+        for (const uid of block.eligibleParticipants) {
+            batchParticipants.add(uid);
+        }
+    }
+    if (batchParticipants.size > 0) {
+        const profiles = memory.getProfilesForChat(chatId);
+        const memberLines: string[] = [];
+        for (const p of profiles) {
+            if (!batchParticipants.has(p.userId)) continue;
+            const traits = p.traits.slice(0, MAX_RECORDED_MEMBER_LIST_IN_PROMPT);
+            const interests = p.interests.slice(0, MAX_RECORDED_MEMBER_LIST_IN_PROMPT);
+            const style = p.communicationStyle.trim();
+            if (traits.length === 0 && interests.length === 0 && !style) continue;
+            const parts: string[] = [];
+            if (traits.length > 0) parts.push(`traits=[${traits.join("；")}]`);
+            if (interests.length > 0) parts.push(`interests=[${interests.join("；")}]`);
+            if (style) parts.push(`style="${style}"`);
+            memberLines.push(`  - ${p.userId}: ${parts.join(", ")}`);
+            if (memberLines.length >= MAX_RECORDED_MEMBERS_IN_PROMPT) break;
+        }
+        if (memberLines.length > 0) {
+            lines.push(`- 已有成员画像 (${memberLines.length} 人):`);
+            lines.push(...memberLines);
+        }
+    }
+
+    if (lines.length === 0) return null;
+    return `## 已有记录（不要重复或换一种说法再写一遍）\n\n${lines.join("\n")}`;
 }
 
 function buildSynthesisPromptText(
@@ -1931,6 +2208,8 @@ function buildSynthesisPromptText(
         `- 话题数量: ${topicBlocks.length}`,
     ];
 
+    const alreadyRecordedSection = buildAlreadyRecordedSection(chatId, topicBlocks, memory, groupModel);
+
     const topicSections = topicBlocks.map((block, idx) => {
         const msgLines = block.sampledMessages.map(m => {
             const reply = m.replyToMessageId ? ` [replyTo:${m.replyToMessageId}]` : "";
@@ -1949,17 +2228,20 @@ function buildSynthesisPromptText(
         ].join("\n");
     }).join("\n\n---\n\n");
 
-    return [
-        headerLines.join("\n"),
-        `## 历史话题与采样消息\n\n${topicSections}`,
-        `## 任务与输出格式\n\n${userInstruction}`,
-    ].join("\n\n---\n\n");
+    const sections = [headerLines.join("\n")];
+    if (alreadyRecordedSection) {
+        sections.push(alreadyRecordedSection);
+    }
+    sections.push(`## 历史话题与采样消息\n\n${topicSections}`);
+    sections.push(`## 任务与输出格式\n\n${userInstruction}`);
+    return sections.join("\n\n---\n\n");
 }
 
 function groundSynthesisOutput(
     chatId: string,
     raw: ValidatedSynthesisRaw,
     topicBlocks: readonly SynthesisTopicBlock[],
+    memory: MemoryStoreV2,
 ): SynthesisUnitOutput {
     const blockByTopicId = new Map<string, SynthesisTopicBlock>(
         topicBlocks.map(b => [b.topic.id, b]),
@@ -2065,12 +2347,14 @@ function groundSynthesisOutput(
         return undefined;
     };
 
-    const extractCitedGroupList = (rawField: unknown): string[] | undefined => {
+    const extractCitedGroupList = (rawField: unknown, cap: number): string[] | undefined => {
         if (Array.isArray(rawField)) {
             if (!batchGroupEvidenceValid) return undefined;
-            const items = rawField
+            const filtered = rawField
                 .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
-                .map(s => s.trim());
+                .map(s => s.trim())
+                .filter(s => !isPlaceholderSynthesisText(s));
+            const items = mergeStringsNearDedupe([], filtered, cap);
             return items.length > 0 ? items : undefined;
         }
         if (rawField && typeof rawField === "object" && !Array.isArray(rawField)) {
@@ -2078,9 +2362,11 @@ function groundSynthesisOutput(
             if (!Array.isArray(rec.value)) return undefined;
             const cited = validateCitation(rec.topicId, rec.messageIds);
             if (!cited) return undefined;
-            const items = rec.value
+            const filtered = rec.value
                 .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
-                .map(s => s.trim());
+                .map(s => s.trim())
+                .filter(s => !isPlaceholderSynthesisText(s));
+            const items = mergeStringsNearDedupe([], filtered, cap);
             if (items.length === 0) return undefined;
             groupPatchCitations.push({ topicId: cited.topicId, messageIds: cited.validMsgIds });
             return items;
@@ -2100,15 +2386,15 @@ function groundSynthesisOutput(
     if (eng === "high" || eng === "medium" || eng === "low") {
         groupPatch.engagementLevel = eng;
     }
-    const norms = extractCitedGroupList(gu.communicationNorms);
+    const norms = extractCitedGroupList(gu.communicationNorms, MAX_GROUP_NORMS_SEED_ITEMS);
     if (norms) {
         groupPatch.communicationNorms = norms;
     }
-    const hot = extractCitedGroupList(gu.hotTopics);
+    const hot = extractCitedGroupList(gu.hotTopics, MAX_GROUP_HOT_TOPICS_SEED_ITEMS);
     if (hot) {
         groupPatch.hotTopics = hot;
     }
-    const taboo = extractCitedGroupList(gu.tabooTopics);
+    const taboo = extractCitedGroupList(gu.tabooTopics, MAX_GROUP_TABOO_TOPICS_SEED_ITEMS);
     if (taboo) {
         groupPatch.tabooTopics = taboo;
     }
@@ -2195,11 +2481,14 @@ function groundSynthesisOutput(
             }
         }
 
-        if (traits.length > 0 || interests.length > 0 || communicationStyle || episodes.length > 0) {
+        const dedupedTraits = mergeStringsNearDedupe([], traits, MAX_MEMBER_TRAITS_SEED_ITEMS);
+        const dedupedInterests = mergeStringsNearDedupe([], interests, MAX_MEMBER_INTERESTS_SEED_ITEMS);
+
+        if (dedupedTraits.length > 0 || dedupedInterests.length > 0 || communicationStyle || episodes.length > 0) {
             const existing = memberPatchesByUser.get(userId);
             if (existing) {
-                existing.traits = [...(existing.traits ?? []), ...traits];
-                existing.interests = [...(existing.interests ?? []), ...interests];
+                existing.traits = mergeStringsNearDedupe(existing.traits ?? [], dedupedTraits, MAX_MEMBER_TRAITS_SEED_ITEMS);
+                existing.interests = mergeStringsNearDedupe(existing.interests ?? [], dedupedInterests, MAX_MEMBER_INTERESTS_SEED_ITEMS);
                 if (communicationStyle && !existing.communicationStyle) {
                     existing.communicationStyle = communicationStyle;
                 }
@@ -2207,8 +2496,8 @@ function groundSynthesisOutput(
             } else {
                 memberPatchesByUser.set(userId, {
                     userId,
-                    traits,
-                    interests,
+                    traits: dedupedTraits,
+                    interests: dedupedInterests,
                     communicationStyle,
                     episodes,
                 });
@@ -2220,20 +2509,54 @@ function groundSynthesisOutput(
     //    GroupObservations -> category: 'general', subject: 'group:<chatId>'
     //    Explicitly ignore/reject any personalClaims or biographical facts!
     const factProposals: HistorySynthesisFactProposal[] = [];
+    const seenFactHistoryKeys = new Set<string>();
+    const knownMemeVariants = loadStoredNormalizedMemeVariants(memory, chatId);
+    let acceptedMemesCount = 0;
+    let acceptedObsCount = 0;
     const groupSubject = `group:${chatId}`;
+    const sampledTextByTopicAndMsgId = new Map<string, Map<string, string>>();
+    for (const block of topicBlocks) {
+        sampledTextByTopicAndMsgId.set(
+            block.topic.id,
+            new Map(block.sampledMessages.map(m => [m.messageId, m.text])),
+        );
+    }
 
     for (const item of raw.memes) {
+        if (acceptedMemesCount >= MAX_MEMES_PER_SYNTHESIS_UNIT) break;
         if (!item || typeof item !== "object" || Array.isArray(item)) continue;
         const rec = item as Record<string, unknown>;
         const term = typeof rec.term === "string" ? rec.term.trim() : "";
         const meaning = typeof rec.meaning === "string" ? rec.meaning.trim() : "";
         const usageBoundaries = typeof rec.usageBoundaries === "string" ? rec.usageBoundaries.trim() : "";
         if (!term || !meaning || !usageBoundaries) continue;
+        if (isPlaceholderSynthesisText(meaning)) continue;
+
+        const originContext = typeof rec.originContext === "string" ? rec.originContext.trim() : "";
+        if (originContext && isPlaceholderSynthesisText(originContext)) continue;
 
         const cited = validateCitation(rec.topicId, rec.messageIds);
         if (!cited) continue;
 
-        const originContext = typeof rec.originContext === "string" ? rec.originContext.trim() : "";
+        const msgTextMap = sampledTextByTopicAndMsgId.get(cited.topicId);
+        const citedTexts = cited.validMsgIds.map(mid => msgTextMap?.get(mid) ?? "");
+        const attestedTerm = attestMemeTerm(term, citedTexts);
+        if (!attestedTerm) continue;
+
+        const normalizedVariants = extractNormalizedMemeVariants(attestedTerm);
+        if (normalizedVariants.length === 0 || hasOverlappingMemeVariant(normalizedVariants, knownMemeVariants)) {
+            continue;
+        }
+
+        const attestedVariantsForCount = attestedTerm
+            .split(MEME_VARIANT_SPLIT_RE)
+            .map(v => v.trim())
+            .filter(v => Array.from(v).length >= MIN_MEME_RECURRENCE_VARIANT_CHARS);
+        const usage = memory.countChatMemeVariantUsage(chatId, attestedVariantsForCount);
+        if (usage.senderCount < MIN_MEME_RECURRENCE_SENDERS && usage.messageCount < MIN_MEME_RECURRENCE_MESSAGES) {
+            continue;
+        }
+
         const participants = Array.isArray(rec.participants)
             ? rec.participants
                 .filter((p): p is string => typeof p === "string" && cited.block.eligibleParticipants.has(p.trim()))
@@ -2241,15 +2564,22 @@ function groundSynthesisOutput(
             : [];
         const canonical = typeof rec.canonicalKey === "string" && rec.canonicalKey.trim()
             ? rec.canonicalKey.trim()
-            : term;
+            : attestedTerm;
         const historyKey = `hist_meme:${createHash("sha256").update(`${chatId}\n${canonical}`).digest("hex").slice(0, 24)}`;
+        if (seenFactHistoryKeys.has(historyKey)) continue;
+        seenFactHistoryKeys.add(historyKey);
+        for (const v of normalizedVariants) {
+            knownMemeVariants.add(v);
+        }
+        acceptedMemesCount++;
 
         const contentParts = [
-            `[群梗: ${term}]`,
+            `[群梗: ${attestedTerm}]`,
             `真实含义: ${meaning}`,
             originContext ? `来源背景: ${originContext}` : "",
             participants.length > 0 ? `相关成员: ${[...new Set(participants)].join(", ")}` : "",
             `使用边界: ${usageBoundaries}`,
+            `使用情况: 导入的历史中 ${usage.messageCount} 条消息、${usage.senderCount} 人用过`,
         ].filter(Boolean);
 
         factProposals.push({
@@ -2267,6 +2597,7 @@ function groundSynthesisOutput(
     }
 
     for (const item of raw.groupObservations) {
+        if (acceptedObsCount >= MAX_OBSERVATIONS_PER_SYNTHESIS_UNIT) break;
         if (!item || typeof item !== "object" || Array.isArray(item)) continue;
         const rec = item as Record<string, unknown>;
         const content = typeof rec.content === "string" ? rec.content.trim() : "";
@@ -2276,10 +2607,24 @@ function groundSynthesisOutput(
         const cited = validateCitation(rec.topicId, rec.messageIds);
         if (!cited) continue;
 
+        const distinctSenders = new Set<string>();
+        for (const mid of cited.validMsgIds) {
+            const uid = messageAuthorByTopicAndId.get(`${cited.topicId}\n${mid}`);
+            if (uid && uid !== "system") distinctSenders.add(uid);
+        }
+        if (distinctSenders.size < MIN_OBSERVATION_DISTINCT_SENDERS) continue;
+
+        if (factProposals.some(kept => kept.category === "general" && isNearDuplicateText(kept.content, content))) {
+            continue;
+        }
+
         const canonical = typeof rec.canonicalKey === "string" && rec.canonicalKey.trim()
             ? rec.canonicalKey.trim()
             : content;
         const historyKey = `hist_obs:${createHash("sha256").update(`${chatId}\n${canonical}`).digest("hex").slice(0, 24)}`;
+        if (seenFactHistoryKeys.has(historyKey)) continue;
+        seenFactHistoryKeys.add(historyKey);
+        acceptedObsCount++;
 
         factProposals.push({
             historyKey,
@@ -2311,8 +2656,8 @@ function groundSynthesisOutput(
 }
 
 function mergeSynthesisOutputs(left: SynthesisUnitOutput, right: SynthesisUnitOutput): SynthesisUnitOutput {
-    const dedupe = (a?: string[], b?: string[]): string[] | undefined => {
-        const merged = [...new Set([...(a ?? []), ...(b ?? [])])];
+    const mergeList = (a?: string[], b?: string[], cap: number = 12): string[] | undefined => {
+        const merged = mergeStringsNearDedupe(a ?? [], b ?? [], cap);
         return merged.length > 0 ? merged : undefined;
     };
 
@@ -2321,26 +2666,64 @@ function mergeSynthesisOutputs(left: SynthesisUnitOutput, right: SynthesisUnitOu
         description: right.groupPatch.description ?? left.groupPatch.description,
         dominantLanguage: right.groupPatch.dominantLanguage ?? left.groupPatch.dominantLanguage,
         engagementLevel: right.groupPatch.engagementLevel ?? left.groupPatch.engagementLevel,
-        communicationNorms: dedupe(left.groupPatch.communicationNorms, right.groupPatch.communicationNorms),
-        hotTopics: dedupe(left.groupPatch.hotTopics, right.groupPatch.hotTopics),
-        tabooTopics: dedupe(left.groupPatch.tabooTopics, right.groupPatch.tabooTopics),
+        communicationNorms: mergeList(left.groupPatch.communicationNorms, right.groupPatch.communicationNorms, MAX_GROUP_NORMS_SEED_ITEMS),
+        hotTopics: mergeList(left.groupPatch.hotTopics, right.groupPatch.hotTopics, MAX_GROUP_HOT_TOPICS_SEED_ITEMS),
+        tabooTopics: mergeList(left.groupPatch.tabooTopics, right.groupPatch.tabooTopics, MAX_GROUP_TABOO_TOPICS_SEED_ITEMS),
     };
 
     const memberMap = new Map<string, HistorySynthesisMemberPatch>();
     for (const mp of [...left.memberPatches, ...right.memberPatches]) {
         const existing = memberMap.get(mp.userId);
         if (!existing) {
-            memberMap.set(mp.userId, { ...mp });
+            memberMap.set(mp.userId, {
+                ...mp,
+                traits: mp.traits ? mergeStringsNearDedupe([], mp.traits, MAX_MEMBER_TRAITS_SEED_ITEMS) : undefined,
+                interests: mp.interests ? mergeStringsNearDedupe([], mp.interests, MAX_MEMBER_INTERESTS_SEED_ITEMS) : undefined,
+            });
         } else {
-            existing.traits = [...new Set([...(existing.traits ?? []), ...(mp.traits ?? [])])];
-            existing.interests = [...new Set([...(existing.interests ?? []), ...(mp.interests ?? [])])];
+            existing.traits = mergeStringsNearDedupe(existing.traits ?? [], mp.traits ?? [], MAX_MEMBER_TRAITS_SEED_ITEMS);
+            existing.interests = mergeStringsNearDedupe(existing.interests ?? [], mp.interests ?? [], MAX_MEMBER_INTERESTS_SEED_ITEMS);
             existing.communicationStyle = mp.communicationStyle ?? existing.communicationStyle;
             existing.episodes = [...(existing.episodes ?? []), ...(mp.episodes ?? [])];
         }
     }
 
     const factMap = new Map<string, HistorySynthesisFactProposal>();
+    const keptMemeVariants = new Set<string>();
+    let acceptedMemesCount = 0;
+    let acceptedObsCount = 0;
     for (const f of [...left.factProposals, ...right.factProposals]) {
+        if (factMap.has(f.historyKey)) {
+            continue;
+        }
+        if (f.category === "anecdote") {
+            if (acceptedMemesCount >= MAX_MEMES_PER_SYNTHESIS_UNIT) continue;
+            const term = extractMemeTermFromFactContent(f.content);
+            const variants = term ? extractNormalizedMemeVariants(term) : [];
+            if (variants.length > 0 && hasOverlappingMemeVariant(variants, keptMemeVariants)) {
+                continue;
+            }
+            for (const v of variants) {
+                keptMemeVariants.add(v);
+            }
+            acceptedMemesCount++;
+            factMap.set(f.historyKey, f);
+            continue;
+        }
+        if (f.category === "general") {
+            if (acceptedObsCount >= MAX_OBSERVATIONS_PER_SYNTHESIS_UNIT) continue;
+            let isDup = false;
+            for (const kept of factMap.values()) {
+                if (kept.category === "general" && isNearDuplicateText(kept.content, f.content)) {
+                    isDup = true;
+                    break;
+                }
+            }
+            if (isDup) continue;
+            acceptedObsCount++;
+            factMap.set(f.historyKey, f);
+            continue;
+        }
         factMap.set(f.historyKey, f);
     }
 
@@ -2401,7 +2784,7 @@ async function synthesizeBatchResilient(params: {
                 schemaDescription: '{"groupUpdates":{"evidence":[]},"memberProfiles":[],"memes":[],"groupObservations":[]}',
                 validate: validateSynthesisResponse,
             });
-            return groundSynthesisOutput(params.chatId, parsed, effectiveBlocks);
+            return groundSynthesisOutput(params.chatId, parsed, effectiveBlocks, params.memory);
         } catch (err) {
             if (classifyHistoryLlmError(err) === "size_reducible") {
                 if (blocks.length > 1) {

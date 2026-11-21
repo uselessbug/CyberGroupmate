@@ -88,9 +88,9 @@ export const DEFAULT_WINDOW_MESSAGES = 120;
 export const DEFAULT_WINDOW_HOURS = 4;
 export const DEFAULT_GAP_MINUTES = 30;
 export const DEFAULT_MIN_WINDOW_MESSAGES = 10;
-export const DEFAULT_MAX_TOPICS_PER_BATCH = 24;
+export const DEFAULT_MAX_TOPICS_PER_BATCH = 8;
 export const DEFAULT_MAX_SAMPLE_MESSAGES_PER_TOPIC = 12;
-export const SYNTHESIS_PROMPT_REVISION = "synth-v2";
+export const SYNTHESIS_PROMPT_REVISION = "synth-v4";
 
 interface ParsedQceMetaFlags {
     timeUnknown?: boolean;

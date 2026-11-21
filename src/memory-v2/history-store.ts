@@ -9,6 +9,13 @@ import {
     type ChatNameObservation,
 } from "./chat-names.js";
 import { embeddingToBuffer } from "./embedding.js";
+import {
+    extractMemeTermFromFactContent,
+    extractNormalizedMemeVariants,
+    hasOverlappingMemeVariant,
+    isNearDuplicateText,
+    mergeStringsNearDedupe,
+} from "./text-similarity.js";
 import type { FactCategory, InteractionEpisode, MessageLogEntry, TopicNode } from "./types.js";
 
 export type MessageOrigin = "legacy" | "live" | "qce";
@@ -46,6 +53,11 @@ export interface ChatActivityStats {
     activeMembers: number;
     avgMessagesPerDay: number;
     peakHours: number[];
+}
+
+export interface MemeVariantUsageCounts {
+    messageCount: number;
+    senderCount: number;
 }
 
 export class HistoryLeaseError extends Error {
@@ -245,8 +257,12 @@ export interface HistoryFinalizeQceImportInput {
 
 export const NEWCOMER_AGENT_ROLE = "新入群观察者（正在熟悉群聊文化与成员）";
 const MAX_OFFLINE_EPISODES = 12;
-const MAX_GROUP_LIST_SEED_ITEMS = 10;
-const MAX_MEMBER_LIST_SEED_ITEMS = 12;
+export const MAX_GROUP_NORMS_SEED_ITEMS = 12;
+export const MAX_GROUP_HOT_TOPICS_SEED_ITEMS = 12;
+export const MAX_GROUP_TABOO_TOPICS_SEED_ITEMS = 8;
+export const MAX_MEMBER_TRAITS_SEED_ITEMS = 8;
+export const MAX_MEMBER_INTERESTS_SEED_ITEMS = 8;
+export const MIN_MEME_RECURRENCE_VARIANT_CHARS = 2;
 
 export interface IngestMessage extends MessageLogEntry {
     origin: MessageOrigin;
@@ -1186,6 +1202,74 @@ export class HistoryStore {
         return new Set(rows.map(r => r.message_id));
     }
 
+    /**
+     * Count distinct eligible messages and senders in `chatId` matching any variant
+     * via parameterised literal substring lookup (`instr`), ignoring variants shorter than 2 chars.
+     */
+    countChatMemeVariantUsage(chatId: string, variants: readonly string[]): MemeVariantUsageCounts {
+        const cleanChatId = chatId?.trim();
+        if (!cleanChatId) {
+            return { messageCount: 0, senderCount: 0 };
+        }
+        const cleanVariants: string[] = [];
+        const seenLower = new Set<string>();
+        for (const raw of variants) {
+            if (typeof raw !== "string") continue;
+            const trimmed = raw.trim();
+            if (Array.from(trimmed).length < MIN_MEME_RECURRENCE_VARIANT_CHARS) continue;
+            const lower = trimmed.toLowerCase();
+            if (seenLower.has(lower)) continue;
+            seenLower.add(lower);
+            cleanVariants.push(trimmed);
+            if (cleanVariants.length >= 50) break;
+        }
+        if (cleanVariants.length === 0) {
+            return { messageCount: 0, senderCount: 0 };
+        }
+
+        const effectiveTextExpr = `
+            CASE
+                WHEN qce_meta IS NOT NULL
+                  AND json_valid(qce_meta)
+                  AND json_extract(qce_meta, '$.hasForward') = 1
+                  AND json_type(qce_meta, '$.evidenceText') = 'text'
+                THEN json_extract(qce_meta, '$.evidenceText')
+                ELSE text
+            END
+        `;
+        const variantPredicates = cleanVariants
+            .map(() => `instr(lower(${effectiveTextExpr}), lower(?)) > 0`)
+            .join(" OR ");
+
+        const row = this.db.prepare(`
+            SELECT
+                COUNT(DISTINCT message_id) AS message_count,
+                COUNT(DISTINCT user_id) AS sender_count
+            FROM message_log
+            WHERE chat_id = ?
+              AND access_control_blocked = 0
+              AND user_id != ''
+              AND user_id != 'system'
+              AND timestamp != '1970-01-01T00:00:00.000Z'
+              AND CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER) > 86400000
+              AND (
+                qce_meta IS NULL
+                OR NOT json_valid(qce_meta)
+                OR (
+                  COALESCE(json_extract(qce_meta, '$.timeUnknown'), 0) != 1
+                  AND COALESCE(json_extract(qce_meta, '$.recalled'), 0) != 1
+                  AND COALESCE(json_extract(qce_meta, '$.system'), 0) != 1
+                )
+              )
+              AND (${variantPredicates})
+        `).get(cleanChatId, ...cleanVariants) as { message_count: number; sender_count: number } | undefined;
+
+        return {
+            messageCount: Number(row?.message_count ?? 0),
+            senderCount: Number(row?.sender_count ?? 0),
+        };
+    }
+
     getHistoricalTopicsForChat(chatId: string): TopicNode[] {
         const rows = this.db.prepare(`
             SELECT *
@@ -1644,8 +1728,9 @@ export class HistoryStore {
                 col: string,
                 currentRaw: unknown,
                 incoming: string[] | undefined,
+                cap: number,
             ) => {
-                const cleanIncoming = dedupeCapStrings(incoming ?? [], MAX_GROUP_LIST_SEED_ITEMS);
+                const cleanIncoming = mergeStringsNearDedupe([], incoming ?? [], cap);
                 if (cleanIncoming.length === 0) return;
                 const current = parseJsonSafe<string[]>(currentRaw as string, []);
                 const currentHash = hashSeedValue(current);
@@ -1659,7 +1744,8 @@ export class HistoryStore {
                 if (!canWrite) return;
                 const nextVal = isEmpty
                     ? cleanIncoming
-                    : dedupeCapStrings([...cleanIncoming, ...current], MAX_GROUP_LIST_SEED_ITEMS);
+                    : mergeStringsNearDedupe(current, cleanIncoming, cap);
+                if (!isEmpty && arraysEqual(nextVal, current)) return;
                 groupSets.push({ col, val: JSON.stringify(nextVal) });
                 upsertSeedStmt.run(input.chatId, "group", input.chatId, field, input.rankKey, hashSeedValue(nextVal));
                 groupFieldsWritten.push(field);
@@ -1687,9 +1773,9 @@ export class HistoryStore {
                 gp.engagementLevel,
                 (cur) => cur.trim() === "" || (!hasLastReflected && cur === "medium"),
             );
-            tryGroupListField("communicationNorms", "communication_norms", groupRow.communication_norms, gp.communicationNorms);
-            tryGroupListField("hotTopics", "hot_topics", groupRow.hot_topics, gp.hotTopics);
-            tryGroupListField("tabooTopics", "taboo_topics", groupRow.taboo_topics, gp.tabooTopics);
+            tryGroupListField("communicationNorms", "communication_norms", groupRow.communication_norms, gp.communicationNorms, MAX_GROUP_NORMS_SEED_ITEMS);
+            tryGroupListField("hotTopics", "hot_topics", groupRow.hot_topics, gp.hotTopics, MAX_GROUP_HOT_TOPICS_SEED_ITEMS);
+            tryGroupListField("tabooTopics", "taboo_topics", groupRow.taboo_topics, gp.tabooTopics, MAX_GROUP_TABOO_TOPICS_SEED_ITEMS);
             // Hard-coded newcomer observer agentRole at storage boundary (never accept caller-supplied agentRole)
             tryGroupScalarField(
                 "agentRole",
@@ -1756,7 +1842,7 @@ export class HistoryStore {
                 }
 
                 // Guarded traits (never overwrite if seedRow exists & live/manual cleared or edited)
-                const incomingTraits = dedupeCapStrings(mp.traits ?? [], MAX_MEMBER_LIST_SEED_ITEMS);
+                const incomingTraits = mergeStringsNearDedupe([], mp.traits ?? [], MAX_MEMBER_TRAITS_SEED_ITEMS);
                 if (incomingTraits.length > 0) {
                     const curTraits = parseJsonSafe<string[]>(existing.traits as string, []);
                     const curHash = hashSeedValue(curTraits);
@@ -1770,14 +1856,16 @@ export class HistoryStore {
                     if (canWrite) {
                         const nextTraits = isEmpty
                             ? incomingTraits
-                            : dedupeCapStrings([...incomingTraits, ...curTraits], MAX_MEMBER_LIST_SEED_ITEMS);
-                        memberSets.push({ col: "traits", val: JSON.stringify(nextTraits) });
-                        upsertSeedStmt.run(input.chatId, "member", uid, "traits", input.rankKey, hashSeedValue(nextTraits));
+                            : mergeStringsNearDedupe(curTraits, incomingTraits, MAX_MEMBER_TRAITS_SEED_ITEMS);
+                        if (isEmpty || !arraysEqual(nextTraits, curTraits)) {
+                            memberSets.push({ col: "traits", val: JSON.stringify(nextTraits) });
+                            upsertSeedStmt.run(input.chatId, "member", uid, "traits", input.rankKey, hashSeedValue(nextTraits));
+                        }
                     }
                 }
 
                 // Guarded interests
-                const incomingInterests = dedupeCapStrings(mp.interests ?? [], MAX_MEMBER_LIST_SEED_ITEMS);
+                const incomingInterests = mergeStringsNearDedupe([], mp.interests ?? [], MAX_MEMBER_INTERESTS_SEED_ITEMS);
                 if (incomingInterests.length > 0) {
                     const curInterests = parseJsonSafe<string[]>(existing.interests as string, []);
                     const curHash = hashSeedValue(curInterests);
@@ -1791,9 +1879,11 @@ export class HistoryStore {
                     if (canWrite) {
                         const nextInterests = isEmpty
                             ? incomingInterests
-                            : dedupeCapStrings([...incomingInterests, ...curInterests], MAX_MEMBER_LIST_SEED_ITEMS);
-                        memberSets.push({ col: "interests", val: JSON.stringify(nextInterests) });
-                        upsertSeedStmt.run(input.chatId, "member", uid, "interests", input.rankKey, hashSeedValue(nextInterests));
+                            : mergeStringsNearDedupe(curInterests, incomingInterests, MAX_MEMBER_INTERESTS_SEED_ITEMS);
+                        if (isEmpty || !arraysEqual(nextInterests, curInterests)) {
+                            memberSets.push({ col: "interests", val: JSON.stringify(nextInterests) });
+                            upsertSeedStmt.run(input.chatId, "member", uid, "interests", input.rankKey, hashSeedValue(nextInterests));
+                        }
                     }
                 }
 
@@ -1914,6 +2004,28 @@ export class HistoryStore {
                 ? this.db.prepare(`DELETE FROM facts_vec WHERE fact_id = ?`)
                 : null;
 
+            const storedGroupObservations = this.db.prepare(`
+                SELECT id, content, history_key
+                FROM core_facts
+                WHERE source_chat_id = ? AND subject = ? AND category = 'general'
+                  AND (expires_at IS NULL OR expires_at > datetime('now'))
+            `).all(input.chatId, expectedSubject) as Array<{ id: string; content: string; history_key: string | null }>;
+
+            const storedMemeRows = this.db.prepare(`
+                SELECT id, content, history_key
+                FROM core_facts
+                WHERE source_chat_id = ? AND subject = ? AND category = 'anecdote'
+                  AND (expires_at IS NULL OR expires_at > datetime('now'))
+            `).all(input.chatId, expectedSubject) as Array<{ id: string; content: string; history_key: string | null }>;
+            const knownMemeVariants = new Set<string>();
+            for (const row of storedMemeRows) {
+                const term = extractMemeTermFromFactContent(row.content);
+                if (!term) continue;
+                for (const v of extractNormalizedMemeVariants(term)) {
+                    knownMemeVariants.add(v);
+                }
+            }
+
             let factsCommitted = 0;
             for (const fact of input.factProposals) {
                 const existingByKey = selectFactByKey.get(input.chatId, fact.historyKey) as
@@ -1923,6 +2035,19 @@ export class HistoryStore {
                     const existingById = selectFactById.get(fact.id) as { id: string; history_key: string | null } | undefined;
                     if (existingById && existingById.history_key === null) {
                         // Never overwrite a live fact
+                        continue;
+                    }
+                }
+                if (!existingByKey && fact.category === "general") {
+                    if (storedGroupObservations.some(obs => isNearDuplicateText(obs.content, fact.content))) {
+                        continue;
+                    }
+                }
+                let incomingMemeVariants: string[] = [];
+                if (!existingByKey && fact.category === "anecdote") {
+                    const term = extractMemeTermFromFactContent(fact.content);
+                    incomingMemeVariants = term ? extractNormalizedMemeVariants(term) : [];
+                    if (incomingMemeVariants.length > 0 && hasOverlappingMemeVariant(incomingMemeVariants, knownMemeVariants)) {
                         continue;
                     }
                 }
@@ -1952,6 +2077,10 @@ export class HistoryStore {
                     if (contentChanged && deleteFactVecStmt) {
                         deleteFactVecStmt.run(factId);
                     }
+                    if (fact.category === "general") {
+                        const existingObs = storedGroupObservations.find(obs => obs.id === factId);
+                        if (existingObs) existingObs.content = fact.content;
+                    }
                 } else {
                     insertFactStmt.run(
                         factId,
@@ -1971,6 +2100,17 @@ export class HistoryStore {
                         ts,
                         ts,
                     );
+                    if (fact.category === "general") {
+                        storedGroupObservations.push({
+                            id: factId,
+                            content: fact.content,
+                            history_key: fact.historyKey,
+                        });
+                    } else if (fact.category === "anecdote") {
+                        for (const v of incomingMemeVariants) {
+                            knownMemeVariants.add(v);
+                        }
+                    }
                 }
 
                 // Strict internal FTS sync: throws & rolls back on error
@@ -2113,16 +2253,10 @@ function parseJsonSafe<T>(raw: string | null | undefined, fallback: T): T {
     }
 }
 
-function dedupeCapStrings(values: readonly string[], cap: number): string[] {
-    const out: string[] = [];
-    const seen = new Set<string>();
-    for (const raw of values) {
-        if (typeof raw !== "string") continue;
-        const trimmed = raw.trim();
-        if (!trimmed || seen.has(trimmed)) continue;
-        seen.add(trimmed);
-        out.push(trimmed);
-        if (out.length >= cap) break;
+function arraysEqual(a: readonly string[], b: readonly string[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
     }
-    return out;
+    return true;
 }

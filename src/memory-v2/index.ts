@@ -49,6 +49,7 @@ export {
     type HistoryUnitStage,
     type IngestBatchResult,
     type IngestMessage,
+    type MemeVariantUsageCounts,
     type MessageOrigin,
     type UpsertHistoryJobInput,
 } from "./history-store.js";

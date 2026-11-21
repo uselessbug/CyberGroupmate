@@ -38,6 +38,7 @@ import type {
     HistoryUnitStage,
     IngestBatchResult,
     IngestMessage,
+    MemeVariantUsageCounts,
     MessageOrigin,
     UpsertHistoryJobInput,
 } from "./history-store.js";
@@ -70,6 +71,7 @@ export type {
     HistoryUnitStage,
     IngestBatchResult,
     IngestMessage,
+    MemeVariantUsageCounts,
     MessageOrigin,
     UpsertHistoryJobInput,
 };
@@ -818,6 +820,7 @@ export interface IMemoryStoreV2 {
         outputJson: string,
     ): HistoryUnitRecord;
     getCoveredMessageIds(chatId: string): Set<string>;
+    countChatMemeVariantUsage(chatId: string, variants: readonly string[]): MemeVariantUsageCounts;
     getHistoricalTopicsForChat(chatId: string): TopicNode[];
     commitHistoricalClusterUnit(input: HistoryClusterCommitInput): HistoryClusterCommitResult;
     commitHistoricalSynthesisUnit(input: HistorySynthesisCommitInput): HistorySynthesisCommitResult;

@@ -64,6 +64,7 @@ import {
     type HistoryUnitStage,
     type IngestBatchResult,
     type IngestMessage,
+    type MemeVariantUsageCounts,
     type UpsertHistoryJobInput,
 } from "./history-store.js";
 import type {
@@ -1453,6 +1454,10 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
     getCoveredMessageIds(chatId: string): Set<string> {
         return this.historyStore.getCoveredMessageIds(chatId);
+    }
+
+    countChatMemeVariantUsage(chatId: string, variants: readonly string[]): MemeVariantUsageCounts {
+        return this.historyStore.countChatMemeVariantUsage(chatId, variants);
     }
 
     getHistoricalTopicsForChat(chatId: string): TopicNode[] {

@@ -114,7 +114,7 @@ pnpm history-init \
 `--dry-run` 不会调用任何 LLM API，也不会写入数据库，而是直接输出窗口切分与调用次数估算：
 - `totalWindows` / `uncoveredWindows` / `selectedWindows`
 - `estimatedClusterCalls`（每个聚类窗口预计 2 次调用：话题切分 + 话题摘要）
-- `estimatedSynthesisCalls`（按 UTC ISO 周聚合、每批最多 24 个话题的合成调用数）
+- `estimatedSynthesisCalls`（按 UTC ISO 周聚合、每批最多 8 个话题的合成调用数）
 
 > 提示：你也可以在 `history-init` 中直接通过 `--input /path/to/qce-export` 将「导入 + 初始化」合并到一条命令中执行（当 `--stage` 为 `all` 或 `import` 时生效）。
 
