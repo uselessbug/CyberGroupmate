@@ -73,6 +73,7 @@ Delta 计算发生在类型化的结构数据层，从各个数据源获取的�
 * **实时 Dashboard** — 13+ 面板，WebSocket 推送，CodeAct 实时调试，LLM 调用追踪，记忆搜索编辑，配置热重载。
 * **原生多模态** — 图片、贴纸、视频、动图的识别与理解。
 * **反思引擎** — 周期性 LLM 自我反思，巩固情景记忆、更新人物画像、提取核心事实。
+* **离线历史导入与记忆初始化** — 支持流式导入 `qq-chat-exporter` (QCE) 导出的 QQ 历史聊天记录（`pnpm qce-import`），并在不触发实时唤醒的前提下离线完成历史话题聚类与群文化/群梗/成员画像初始化（`pnpm history-init`）。详见 [docs/qce-history-import.md](docs/qce-history-import.md)。
 * **Prometheus 指标** — Token 用量、请求延迟、TPS、群组统计、系统健康，兼容标准 scraper。
 
 支持平台：Telegram、Discord、QQ (OneBot)
@@ -84,6 +85,8 @@ Delta 计算发生在类型化的结构数据层，从各个数据源获取的�
 也可以[直接阅读我们的 Prompts](system-prompts)，它们的更新频率高于架构文档，能反映最新的设计意图。建议结合架构文档和 Prompts 一起阅读。
 
 另外，也请参考 [作者在用的 PERSONA（人格设置文件）](docs/PERSONA.example.md) 来设置你的赛博群友
+
+如果需要将 QQ 群或私聊的存量历史记录导入系统并离线初始化社会记忆，请参考 [QCE 历史聊天记录导入与离线社会记忆初始化指南](docs/qce-history-import.md)（对应 CLI 命令 `pnpm qce-import` 与 `pnpm history-init`）。
 
 ## 🖥️ 本机原生运行
 

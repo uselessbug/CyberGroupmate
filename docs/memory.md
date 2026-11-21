@@ -932,9 +932,10 @@ Agent 需要"原文回忆"能力——当用户问"alice 昨天具体怎么说�
 
 ### 5.2 消息存储
 
-`message_log` 表在两个时机写入：
+`message_log` 表在以下路径写入：
 1. **即时落盘**：`main.ts nc.onPush()` 中每条消息到达时立即 `storeMessageBatch()`（确保 attend-handler 能即时查到最新消息）
 2. **Pipeline 批量写入**：`RecordingPipeline.flush()` Step 4 批量写入（`INSERT OR IGNORE` 避免与即时落盘冲突）
+3. **QCE 离线历史导入**：通过 `pnpm qce-import`（`npx tsx src/cli.ts history import`）将 `qq-chat-exporter` 导出的历史记录流式写入 `message_log`（标记 `origin = 'qce'`，并同步提取群内名称观测到 `person_chat_names`），随后可通过 `pnpm history-init`（`npx tsx src/cli.ts history init`）执行离线话题聚类与社会记忆初始化。详见 [docs/qce-history-import.md](qce-history-import.md)。
 
 ### 5.3 HistoryBrowseRequest / HistoryBrowseResult
 
