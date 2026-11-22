@@ -277,6 +277,87 @@ export function searchChatNames(
         .slice(0, boundedLimit);
 }
 
+function latestNameKindPriority(kind: ChatNameKind): number {
+    switch (kind) {
+        case "sender_card": return 6;
+        case "sender_display": return 5;
+        case "sender_nickname": return 4;
+        case "sender_name": return 3;
+        case "self_claim": return 2;
+        default: return 1;
+    }
+}
+
+interface RawLatestChatNameRow {
+    chat_id: string;
+    user_id: string;
+    display_name: string;
+    kind: ChatNameKind;
+    observed_at: string;
+}
+
+function createLatestChatNameResolvers(db: Database.Database) {
+    // Uses idx_chat_names_user(chat_id, user_id, observed_at DESC) without full-table sorts.
+    const stmtLatestPrimary = db.prepare(`
+        SELECT n.chat_id, n.user_id, n.display_name, n.kind, n.observed_at
+        FROM person_chat_names n
+        INNER JOIN message_log m
+            ON m.chat_id = n.chat_id AND m.message_id = n.message_id
+        WHERE n.chat_id = ?
+          AND n.user_id = ?
+          AND n.kind != 'mention_display'
+          AND n.display_name != ''
+          AND m.access_control_blocked = 0
+        ORDER BY n.observed_at DESC
+        LIMIT 1
+    `);
+    const stmtPrimaryAtTimestamp = db.prepare(`
+        SELECT n.chat_id, n.user_id, n.display_name, n.kind, n.observed_at
+        FROM person_chat_names n
+        INNER JOIN message_log m
+            ON m.chat_id = n.chat_id AND m.message_id = n.message_id
+        WHERE n.chat_id = ?
+          AND n.user_id = ?
+          AND n.observed_at = ?
+          AND n.kind != 'mention_display'
+          AND n.display_name != ''
+          AND m.access_control_blocked = 0
+    `);
+    const stmtLatestMention = db.prepare(`
+        SELECT n.chat_id, n.user_id, n.display_name, n.kind, n.observed_at
+        FROM person_chat_names n
+        INNER JOIN message_log m
+            ON m.chat_id = n.chat_id AND m.message_id = n.message_id
+        WHERE n.chat_id = ?
+          AND n.user_id = ?
+          AND n.kind = 'mention_display'
+          AND n.display_name != ''
+          AND m.access_control_blocked = 0
+        ORDER BY n.observed_at DESC
+        LIMIT 1
+    `);
+
+    const resolveOne = (chatId: string, userId: string): RawLatestChatNameRow | undefined => {
+        const primary = stmtLatestPrimary.get(chatId, userId) as RawLatestChatNameRow | undefined;
+        if (primary) {
+            const tied = stmtPrimaryAtTimestamp.all(chatId, userId, primary.observed_at) as RawLatestChatNameRow[];
+            let best = primary;
+            let bestPrio = latestNameKindPriority(primary.kind);
+            for (const row of tied) {
+                const prio = latestNameKindPriority(row.kind);
+                if (prio > bestPrio) {
+                    best = row;
+                    bestPrio = prio;
+                }
+            }
+            return best;
+        }
+        return stmtLatestMention.get(chatId, userId) as RawLatestChatNameRow | undefined;
+    };
+
+    return { resolveOne };
+}
+
 export function resolveLatestChatDisplayNames(
     db: Database.Database,
     chatId: string,
@@ -287,60 +368,22 @@ export function resolveLatestChatDisplayNames(
 
     if (userIds && userIds.length === 0) return result;
 
-    const uniqueUserIds = userIds ? [...new Set(userIds.filter(Boolean))] : undefined;
-    if (uniqueUserIds && uniqueUserIds.length === 0) return result;
+    const uniqueUserIds = userIds
+        ? [...new Set(userIds.filter(Boolean))]
+        : (db.prepare(`
+            SELECT DISTINCT user_id
+            FROM person_chat_names
+            WHERE chat_id = ?
+        `).all(chatId) as Array<{ user_id: string }>).map(r => r.user_id).filter(Boolean);
 
-    const CHUNK = 200;
-    const processRows = (rows: Array<{ user_id: string; display_name: string }>) => {
-        for (const row of rows) {
-            if (!result.has(row.user_id) && row.display_name) {
-                result.set(row.user_id, row.display_name);
-            }
+    if (uniqueUserIds.length === 0) return result;
+
+    const { resolveOne } = createLatestChatNameResolvers(db);
+    for (const uid of uniqueUserIds) {
+        const row = resolveOne(chatId, uid);
+        if (row && row.display_name) {
+            result.set(uid, row.display_name);
         }
-    };
-
-    const orderClause = `
-        ORDER BY
-            CASE WHEN n.kind = 'mention_display' THEN 1 ELSE 0 END ASC,
-            n.observed_at DESC,
-            CASE n.kind
-                WHEN 'sender_card' THEN 6
-                WHEN 'sender_display' THEN 5
-                WHEN 'sender_nickname' THEN 4
-                WHEN 'sender_name' THEN 3
-                WHEN 'self_claim' THEN 2
-                ELSE 1
-            END DESC
-    `;
-
-    if (!uniqueUserIds) {
-        const rows = db.prepare(`
-            SELECT n.user_id, n.display_name
-            FROM person_chat_names n
-            INNER JOIN message_log m
-                ON m.chat_id = n.chat_id AND m.message_id = n.message_id
-            WHERE n.chat_id = ?
-              AND m.access_control_blocked = 0
-            ${orderClause}
-        `).all(chatId) as Array<{ user_id: string; display_name: string }>;
-        processRows(rows);
-        return result;
-    }
-
-    for (let i = 0; i < uniqueUserIds.length; i += CHUNK) {
-        const chunk = uniqueUserIds.slice(i, i + CHUNK);
-        const placeholders = chunk.map(() => "?").join(", ");
-        const rows = db.prepare(`
-            SELECT n.user_id, n.display_name
-            FROM person_chat_names n
-            INNER JOIN message_log m
-                ON m.chat_id = n.chat_id AND m.message_id = n.message_id
-            WHERE n.chat_id = ?
-              AND m.access_control_blocked = 0
-              AND n.user_id IN (${placeholders})
-            ${orderClause}
-        `).all(chatId, ...chunk) as Array<{ user_id: string; display_name: string }>;
-        processRows(rows);
     }
 
     return result;
@@ -389,35 +432,8 @@ export function resolveLatestChatNameRecord(
     if (!chatId || typeof chatId !== "string" || !userId || typeof userId !== "string") {
         return null;
     }
-    const row = db.prepare(`
-        SELECT n.chat_id, n.user_id, n.display_name, n.kind, n.observed_at
-        FROM person_chat_names n
-        INNER JOIN message_log m
-            ON m.chat_id = n.chat_id AND m.message_id = n.message_id
-        WHERE n.chat_id = ?
-          AND n.user_id = ?
-          AND m.access_control_blocked = 0
-        ORDER BY
-            CASE WHEN n.kind = 'mention_display' THEN 1 ELSE 0 END ASC,
-            n.observed_at DESC,
-            CASE n.kind
-                WHEN 'sender_card' THEN 6
-                WHEN 'sender_display' THEN 5
-                WHEN 'sender_nickname' THEN 4
-                WHEN 'sender_name' THEN 3
-                WHEN 'self_claim' THEN 2
-                ELSE 1
-            END DESC
-        LIMIT 1
-    `).get(chatId, userId) as
-        | {
-            chat_id: string;
-            user_id: string;
-            display_name: string;
-            kind: ChatNameKind;
-            observed_at: string;
-        }
-        | undefined;
+    const { resolveOne } = createLatestChatNameResolvers(db);
+    const row = resolveOne(chatId, userId);
     if (!row || !row.display_name) return null;
     return {
         chatId: row.chat_id,

@@ -433,10 +433,11 @@ export function buildSynthesisTopicBlock(
     memory: Pick<MemoryStoreV2, "getChatDisplayNames">,
     chatId: string,
     maxSampleMessagesPerTopic: number = DEFAULT_MAX_SAMPLE_MESSAGES_PER_TOPIC,
+    preResolvedDisplayNames?: ReadonlyMap<string, string>,
 ): SynthesisTopicBlock {
     const sampledRawMessages = sampleTopicMessages(topicMessages, maxSampleMessagesPerTopic);
     const userIds = [...new Set(sampledRawMessages.map(m => m.userId).filter(Boolean))];
-    const chatDisplayNames = memory.getChatDisplayNames(chatId, userIds);
+    const chatDisplayNames = preResolvedDisplayNames ?? memory.getChatDisplayNames(chatId, userIds);
 
     const sampledMessages: SampledSynthesisMessage[] = sampledRawMessages.map(m => {
         const localName = chatDisplayNames.get(m.userId)?.trim()
@@ -582,6 +583,16 @@ export function buildSynthesisMacroBatches(
     const boundedMaxTopics = Math.max(1, Math.floor(maxTopicsPerBatch));
     const batches: SynthesisMacroBatch[] = [];
 
+    const allBatchUserIds = new Set<string>();
+    for (const entry of scopedTopicEntries) {
+        for (const msg of entry.messages) {
+            if (msg.userId) allBatchUserIds.add(msg.userId);
+        }
+    }
+    const preResolvedDisplayNames = allBatchUserIds.size > 0
+        ? memory.getChatDisplayNames(chatId, [...allBatchUserIds])
+        : new Map<string, string>();
+
     let batchIdx = 0;
     for (const group of weekGroups) {
         for (let offset = 0, subIdx = 0; offset < group.entries.length; offset += boundedMaxTopics, subIdx++) {
@@ -591,7 +602,14 @@ export function buildSynthesisMacroBatches(
             }
             const chunk = group.entries.slice(offset, offset + boundedMaxTopics);
             const topicBlocks = chunk.map(item =>
-                buildSynthesisTopicBlock(item.topic, item.messages, memory, chatId, maxSampleMessagesPerTopic),
+                buildSynthesisTopicBlock(
+                    item.topic,
+                    item.messages,
+                    memory,
+                    chatId,
+                    maxSampleMessagesPerTopic,
+                    preResolvedDisplayNames,
+                ),
             );
             const batchTopics = chunk.map(item => item.topic);
             const orderedKeys = batchTopics.map(t => t.historyKey ?? t.id);
