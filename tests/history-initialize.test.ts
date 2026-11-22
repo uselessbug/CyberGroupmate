@@ -2960,7 +2960,7 @@ describe("History offline clustering & social memory initialization", () => {
         }
     });
 
-    it("19. Lease stays alive across slow synchronous planning and tolerates transient SQLITE_BUSY on heartbeat", async () => {
+    it("19. A transient SQLITE_BUSY on one lease renewal does not fail the run", async () => {
         const mem = createTestMemory("hist-lease-sync-busy");
         const chatId = "onebot:group:52099";
         try {
@@ -2969,7 +2969,7 @@ describe("History offline clustering & social memory initialization", () => {
                 { id: "lb2", userId: "onebot:2", name: "Bob", text: "beta", ts: "2025-07-01T10:01:00.000Z" },
             ]);
 
-            // Inject a single transient SQLITE_BUSY on heartbeat renewal, followed by normal renewals
+            // Inject a single transient SQLITE_BUSY on the second renewal (whichever path makes it), followed by normal renewals
             const origRenew = mem.renewHistoryLease.bind(mem);
             let renewCalls = 0;
             let injectedBusy = false;
@@ -3018,6 +3018,78 @@ describe("History offline clustering & social memory initialization", () => {
             assert.equal(mem.findLatestHistoryJob("initialize", chatId)?.status, "done");
         } finally {
             cleanupTestMemory(mem, "hist-lease-sync-busy");
+        }
+    });
+
+    it("20. A single synchronous call that outlives the lease stops the run before synthesis writes, and --resume finishes it", async () => {
+        const mem = createTestMemory("hist-lease-long-sync-call");
+        const chatId = "onebot:group:52100";
+        try {
+            seedMessages(mem, chatId, [
+                { id: "ls1", userId: "onebot:1", name: "Alice", text: "alpha", ts: "2025-07-01T10:00:00.000Z" },
+                { id: "ls2", userId: "onebot:2", name: "Bob", text: "beta", ts: "2025-07-01T10:01:00.000Z" },
+            ]);
+
+            // Nothing can renew the lease while one synchronous call holds the event loop: the heartbeat
+            // timer cannot fire and the in-loop renewals only run between calls. Block once, in the
+            // display-name lookup that synthesis planning makes for the whole chat.
+            const leaseTtlMs = 500;
+            const origNames = mem.getChatDisplayNames.bind(mem);
+            let blockedOnce = false;
+            mem.getChatDisplayNames = ((cid: string, ids?: string[]) => {
+                if (!blockedOnce) {
+                    blockedOnce = true;
+                    const until = Date.now() + leaseTtlMs * 2;
+                    while (Date.now() < until) { /* synchronous, like a long SQLite query */ }
+                }
+                return origNames(cid, ids);
+            }) as typeof mem.getChatDisplayNames;
+
+            const calls = { cluster: 0, synthesis: 0 };
+            const llmCall: HistoryLlmCallFn = async (opts) => {
+                if (opts.stage === "cluster") {
+                    calls.cluster++;
+                    return { content: JSON.stringify({ topics: [{ tempId: "t1", label: "Test", messageIds: ["ls1", "ls2"] }] }) };
+                }
+                if (opts.stage !== "synthesis") {
+                    return { content: JSON.stringify({ summaries: [{ tempId: "t_1", label: "Test", summary: "alpha beta summary", keyPoints: ["kp1"], keywords: ["kw1"], sentiment: "neutral" }] }) };
+                }
+                calls.synthesis++;
+                const topic = mem.getHistoricalTopicsForChat(chatId)[0];
+                return {
+                    content: JSON.stringify({
+                        groupUpdates: { description: "Written after resume", evidence: [{ topicId: topic.id, messageIds: ["ls1", "ls2"] }] },
+                        memberProfiles: [],
+                        memes: [],
+                        groupObservations: [],
+                    }),
+                };
+            };
+
+            await assert.rejects(
+                runHistoryInitializationWithMemory(mem, { chatId, stage: "all", leaseTtlMs, config: makeTestConfig(), llmCall }),
+                /History lease lost or expired/,
+            );
+            assert.equal(blockedOnce, true, "Test must block inside synthesis planning");
+            assert.equal(calls.synthesis, 0, "No synthesis call may go out after the lease is gone");
+            assert.equal(mem.getGroupModel(chatId)?.description ?? "", "");
+            assert.equal(mem.getHistoricalTopicsForChat(chatId).length, 1, "Clustering finished under a live lease and is kept");
+            assert.notEqual(mem.findLatestHistoryJob("initialize", chatId)?.status, "done");
+
+            const resumed = await runHistoryInitializationWithMemory(mem, {
+                chatId,
+                stage: "all",
+                resume: true,
+                config: makeTestConfig(),
+                llmCall,
+            });
+            assert.equal(calls.cluster, 1, "Resume must not redo the committed cluster window");
+            assert.equal(calls.synthesis, 1);
+            assert.equal(resumed.processedSynthesisUnits, 1);
+            assert.equal(mem.getGroupModel(chatId)?.description, "Written after resume");
+            assert.equal(mem.findLatestHistoryJob("initialize", chatId)?.status, "done");
+        } finally {
+            cleanupTestMemory(mem, "hist-lease-long-sync-call");
         }
     });
 });
