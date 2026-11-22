@@ -13,6 +13,7 @@ import { OneBotAdapter } from "../src/adapter/onebot-adapter.js";
 import { NotificationCenter } from "../src/event/notification-center.js";
 import { ContextEngine } from "../src/context-engine/context-engine.js";
 import { getExecutorTaskProviders } from "../src/context-engine/providers/executor-providers.js";
+import { insertChatNameObservations, LATEST_CHAT_NAME_SQL } from "../src/memory-v2/chat-names.js";
 
 const chatId = "onebot:group:42";
 const original = { messageId: "1", chatId, userId: "onebot:111", displayName: "Noah/Alice", text: "@Noah /今日猪猪", timestamp: "2026-09-01T00:00:00Z" };
@@ -251,4 +252,44 @@ it("grounds platform-resolved mentions into chatNames with strict scope and loca
         scopeLocal,
     );
     assert.deepEqual(res4, {});
+});
+
+it("resolves the latest chat name on idx_chat_names_user, including names observed at the same instant", () => {
+    const dir = mkdtempSync(join(tmpdir(), "chat-name-plan-"));
+    const memory = new MemoryStoreV2(join(dir, "memory.db"));
+    try {
+        const userId = "onebot:111";
+        const observedAt = "2026-09-01T00:00:00Z";
+        memory.storeMessageBatch([{ ...original, messageId: "p1", displayName: "Display" }]);
+        insertChatNameObservations(memory.db, [
+            { chatId, messageId: "p1", userId, kind: "sender_nickname", displayName: "Nick", observedAt },
+            { chatId, messageId: "p1", userId, kind: "sender_card", displayName: "Card", observedAt },
+        ]);
+        assert.equal(memory.getChatDisplayName(chatId, userId), "Card");
+        assert.equal(memory.getLatestChatNameForUser(chatId, userId)?.kind, "sender_card");
+        assert.deepEqual([...memory.getChatDisplayNames(chatId)], [[userId, "Card"]]);
+
+        // A deployed database never runs ANALYZE. Every lookup has to seek the user's rows in the index:
+        // a plan that only constrains chat_id reads every name ever observed in the chat, once per user.
+        const params: Record<keyof typeof LATEST_CHAT_NAME_SQL, string[]> = {
+            primary: [chatId, userId],
+            primaryAtTimestamp: [chatId, userId, observedAt],
+            mention: [chatId, userId],
+        };
+        for (const [name, sql] of Object.entries(LATEST_CHAT_NAME_SQL)) {
+            const plan = (memory.db.prepare(`EXPLAIN QUERY PLAN ${sql}`)
+                .all(...params[name as keyof typeof LATEST_CHAT_NAME_SQL]) as Array<{ detail: string }>)
+                .map(step => step.detail);
+            const namesStep = plan.find(detail => /\bn USING\b/.test(detail)) ?? "";
+            assert.match(
+                namesStep,
+                /USING INDEX idx_chat_names_user \(chat_id=\? AND user_id=\?/,
+                `${name} must seek person_chat_names by (chat_id, user_id); plan was: ${plan.join(" | ")}`,
+            );
+            assert.ok(!plan.some(detail => /\bSCAN\b|TEMP B-TREE/.test(detail)), `${name} must not scan or sort: ${plan.join(" | ")}`);
+        }
+    } finally {
+        memory.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
 });

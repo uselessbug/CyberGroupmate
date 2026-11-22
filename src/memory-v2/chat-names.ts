@@ -296,9 +296,9 @@ interface RawLatestChatNameRow {
     observed_at: string;
 }
 
-function createLatestChatNameResolvers(db: Database.Database) {
-    // Uses idx_chat_names_user(chat_id, user_id, observed_at DESC) without full-table sorts.
-    const stmtLatestPrimary = db.prepare(`
+// All three must run on idx_chat_names_user(chat_id, user_id, observed_at DESC); exported so tests can check the plans.
+export const LATEST_CHAT_NAME_SQL = {
+    primary: `
         SELECT n.chat_id, n.user_id, n.display_name, n.kind, n.observed_at
         FROM person_chat_names n
         INNER JOIN message_log m
@@ -310,10 +310,12 @@ function createLatestChatNameResolvers(db: Database.Database) {
           AND m.access_control_blocked = 0
         ORDER BY n.observed_at DESC
         LIMIT 1
-    `);
-    const stmtPrimaryAtTimestamp = db.prepare(`
+    `,
+    // Without ORDER BY and without ANALYZE statistics the planner scans the whole chat by primary key,
+    // so the index is named explicitly.
+    primaryAtTimestamp: `
         SELECT n.chat_id, n.user_id, n.display_name, n.kind, n.observed_at
-        FROM person_chat_names n
+        FROM person_chat_names n INDEXED BY idx_chat_names_user
         INNER JOIN message_log m
             ON m.chat_id = n.chat_id AND m.message_id = n.message_id
         WHERE n.chat_id = ?
@@ -322,8 +324,8 @@ function createLatestChatNameResolvers(db: Database.Database) {
           AND n.kind != 'mention_display'
           AND n.display_name != ''
           AND m.access_control_blocked = 0
-    `);
-    const stmtLatestMention = db.prepare(`
+    `,
+    mention: `
         SELECT n.chat_id, n.user_id, n.display_name, n.kind, n.observed_at
         FROM person_chat_names n
         INNER JOIN message_log m
@@ -335,7 +337,13 @@ function createLatestChatNameResolvers(db: Database.Database) {
           AND m.access_control_blocked = 0
         ORDER BY n.observed_at DESC
         LIMIT 1
-    `);
+    `,
+} as const;
+
+function createLatestChatNameResolvers(db: Database.Database) {
+    const stmtLatestPrimary = db.prepare(LATEST_CHAT_NAME_SQL.primary);
+    const stmtPrimaryAtTimestamp = db.prepare(LATEST_CHAT_NAME_SQL.primaryAtTimestamp);
+    const stmtLatestMention = db.prepare(LATEST_CHAT_NAME_SQL.mention);
 
     const resolveOne = (chatId: string, userId: string): RawLatestChatNameRow | undefined => {
         const primary = stmtLatestPrimary.get(chatId, userId) as RawLatestChatNameRow | undefined;
