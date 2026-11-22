@@ -26,13 +26,13 @@ export const COLUMN_WHITELIST = {
         "participants", "keywords", "message_ids",
         "message_count", "started_at", "ended_at", "sentiment",
         "related_topic_ids", "associated_memories", "callback_potential",
-        "embedding", "created_at", "updated_at",
+        "history_key", "embedding", "created_at", "updated_at",
     ],
     core_facts: [
         "subject", "content", "category", "confidence", "source",
         "source_chat_id", "source_chat_title", "source_topic_id", "source_topic_label",
         "source_message_ids", "source_interaction_ids", "observed_at",
-        "visibility", "sensitivity", "embedding", "created_at", "updated_at", "expires_at",
+        "visibility", "sensitivity", "history_key", "history_review", "embedding", "created_at", "updated_at", "expires_at",
     ],
     person_profiles: [
         "traits", "interests", "communication_style", "relation_to_agent",

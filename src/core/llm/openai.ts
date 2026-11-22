@@ -4,6 +4,7 @@
 
 import { Stream } from "openai/streaming";
 import type { LLMConfig } from "../config.js";
+import { createProviderHttpError } from "./http-error.js";
 import { reasoningOriginKey } from "./reasoning-origin.js";
 import type { ChatMessage, LLMResponse } from "./types.js";
 
@@ -92,9 +93,7 @@ export async function callOpenAI(
 
     if (!response.ok) {
         const body = await response.text().catch(() => "");
-        throw new Error(
-            `OpenAI API error ${response.status}: ${response.statusText} — ${body}`
-        );
+        throw createProviderHttpError("OpenAI", response.status, response.statusText, body, response.headers);
     }
 
     const data: ChatCompletionResult = streaming

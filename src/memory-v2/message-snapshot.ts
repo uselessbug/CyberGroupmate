@@ -82,6 +82,7 @@ export function buildMessageSnapshot(
         SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, mentions
         FROM message_log
         WHERE chat_id = ?
+          AND access_control_blocked = 0
           AND timestamp > ?
           AND timestamp <= ?
         ORDER BY timestamp ASC
@@ -102,6 +103,7 @@ export function buildMessageSnapshot(
         SELECT COUNT(*) as cnt
         FROM message_log
         WHERE chat_id = ?
+          AND access_control_blocked = 0
           AND timestamp <= ?
     `).get(chatId, snapshotTimestamp) as { cnt: number };
 
@@ -148,6 +150,7 @@ export function getRecentMessagesUntil(
         SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, mentions
         FROM message_log
         WHERE chat_id = ?
+          AND access_control_blocked = 0
           AND timestamp <= ?
         ORDER BY timestamp DESC
         LIMIT ?

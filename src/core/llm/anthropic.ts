@@ -3,6 +3,7 @@
  */
 
 import type { LLMConfig } from "../config.js";
+import { createProviderHttpError } from "./http-error.js";
 import { reasoningOriginKey } from "./reasoning-origin.js";
 import type { ChatMessage, LLMResponse } from "./types.js";
 
@@ -139,9 +140,7 @@ export async function callAnthropic(
 
     if (!response.ok) {
         const responseBody = await response.text().catch(() => "");
-        throw new Error(
-            `Anthropic API error ${response.status}: ${response.statusText} — ${responseBody}`
-        );
+        throw createProviderHttpError("Anthropic", response.status, response.statusText, responseBody, response.headers);
     }
 
     const data = (await response.json()) as {

@@ -225,10 +225,12 @@ describe("storeMessageBatch", () => {
             mem.getPendingAccessControlMessages("telegram:blocked", 2).map((message) => message.messageId),
             ["b3", "b2"],
         );
-        assert.equal(mem.getRecentMessages("telegram:blocked", 1)[0]?.accessControlBlocked, true);
+        assert.deepEqual(mem.getRecentMessages("telegram:blocked", 5), [], "default getRecentMessages excludes blocked rows");
+        assert.equal(mem.getRecentMessages("telegram:blocked", 1, { includeBlocked: true })[0]?.accessControlBlocked, true);
         assert.equal(mem.markAccessControlMessagesReleased("telegram:blocked"), 3);
         assert.equal(mem.countPendingAccessControlMessages("telegram:blocked"), 0);
-        assert.equal(mem.getRecentMessages("telegram:blocked", 1)[0]?.accessControlBlocked, true, "historical badge remains after release");
+        assert.deepEqual(mem.getRecentMessages("telegram:blocked", 5), [], "released-blocked rows remain excluded from default agent retrieval");
+        assert.equal(mem.getRecentMessages("telegram:blocked", 1, { includeBlocked: true })[0]?.accessControlBlocked, true, "historical badge remains after release");
     });
 
     it("getMessagesBetweenIds returns the full chronological window", () => {

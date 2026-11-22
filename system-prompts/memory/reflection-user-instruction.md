@@ -90,8 +90,9 @@
     {
       "userId": "string (用户ID)",
       "displayName": "string (当前显示名，如有变化)",
-      "sourceMessageIds": ["该账号本人明确自称的原消息 ID"],
-      "aliases": ["string (昵称，请参考原有别名，在有证据的情况下谨慎更新，必须有该 userId 本人原消息的明确自称证据，不能凭外号相似推断)"]
+      "sourceMessageIds": ["该账号本人明确自称或平台结构化 @ 提及绑定的原消息 ID"],
+      "aliases": ["string (全局昵称，请参考原有别名，仅在有该 userId 本人原消息明确自称时更新，不要把同群外号、调侃或单群名片写成全局 aliases)"],
+      "chatNames": ["string (当前会话内有效局部名称，可来自平台结构化 @ 提及映射 `@显示名 [userId]`、本人当前会话发送名或明确自称)"]
     }
   ],
   "groupUpdates": {
@@ -181,6 +182,7 @@
 
 **identityUpdates 说明**：
 - 参考「现有画像」中的已知显示名和别名，仅在发现变化时才输出
-- aliases 只接受该 userId 本人原消息中明确的“叫我/我叫/我的昵称是”等自称，或平台记录中的本人显示名；必须给出 sourceMessageIds。旁人叫法、转述、引用、角色扮演、名字中包含他人名字都不能确认别名。
+- `aliases` 只接受该 userId 本人原消息中明确的“叫我/我叫/我的昵称是”等自称，或本人平台显示名；必须给出 `sourceMessageIds`。绝不要把旁人外号/调侃、转述、引用、角色扮演或跨群不同群名片当成全局 `aliases`。
+- `chatNames` 用于记录当前会话内的局部称呼：除本人自称与发送名外，当前会话中平台解析出的结构化 `@` 提及映射（即消息证据中显式绑定到该 `userId` 的 `mentions[].displayName` / `@显示名 [userId]`，不含 `@all` 与 `account_fallback`）也是合法的会话局部身份证据；仍需附带对应消息的 `sourceMessageIds`。
 - displayName 由平台入站消息维护，Reflection 不修改；不要合并不同 userId 的画像。本人自称未必唯一，别名也不是跨账号关联键。
 - 如果没有身份变化，返回空数组 []

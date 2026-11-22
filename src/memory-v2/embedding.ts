@@ -13,17 +13,63 @@
 
 import { createLogger } from "../core/logger.js";
 import type { EmbeddingConfig, SimilarityMetric } from "../core/config.js";
+import { createProviderHttpError } from "../core/llm/http-error.js";
 
 const log = createLogger("embedding");
 
 // 重新导出给消费者使用
 export type { EmbeddingConfig, SimilarityMetric } from "../core/config.js";
 
+export interface EmbedOptions {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    beforeAttempt?: () => void;
+}
+
 // ─── 常量 ───
 
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [500, 1000, 2000];
 const LOCAL_DIMENSIONS = 128;
+const DEFAULT_EMBED_TIMEOUT_MS = 60_000;
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+        return Promise.reject(signal.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted", "AbortError"));
+    }
+    if (ms <= 0) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+        }, ms);
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(signal?.reason instanceof Error ? signal.reason : new DOMException("The operation was aborted", "AbortError"));
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+function validateEmbeddingVector(raw: unknown, expectedDimensions: number | undefined, index: number): Float32Array {
+    if (!Array.isArray(raw) || raw.length === 0) {
+        throw new Error(`Embedding vector[${index}] is empty or not an array`);
+    }
+    if (expectedDimensions && expectedDimensions > 0 && raw.length !== expectedDimensions) {
+        throw new Error(
+            `Embedding vector[${index}] dimension mismatch: expected ${expectedDimensions}, got ${raw.length}`,
+        );
+    }
+    const vec = new Float32Array(raw.length);
+    for (let i = 0; i < raw.length; i++) {
+        const val = raw[i];
+        if (typeof val !== "number" || !Number.isFinite(val)) {
+            throw new Error(`Embedding vector[${index}][${i}] is non-finite: ${String(val)}`);
+        }
+        vec[i] = val;
+    }
+    return vec;
+}
 
 // ─── 主入口 ───
 
@@ -32,19 +78,27 @@ const LOCAL_DIMENSIONS = 128;
  *
  * @param texts - 待向量化的文本数组
  * @param config - Embedding 配置（来自 config.yaml 或直接传入）
+ * @param options - 可选取消信号与超时配置
  * @returns 与 texts 等长的 Float32Array 数组
  */
 export async function embed(
     texts: string[],
     config: EmbeddingConfig,
+    options?: EmbedOptions,
 ): Promise<Float32Array[]> {
+    if (options?.signal?.aborted) {
+        throw options.signal.reason instanceof Error
+            ? options.signal.reason
+            : new DOMException("The operation was aborted", "AbortError");
+    }
     if (texts.length === 0) return [];
 
     if (config.provider === "openai") {
-        return callEmbeddingAPI(texts, config);
+        return callEmbeddingAPI(texts, config, options);
     }
 
     // 本地模式：同步生成
+    options?.beforeAttempt?.();
     const dims = config.dimensions ?? LOCAL_DIMENSIONS;
     log.debug("embed: 本地模式", { count: texts.length, dims });
     return texts.map(t => localEmbed(t, dims));
@@ -56,20 +110,33 @@ export async function embed(
  * 调用 OpenAI 兼容的 embedding API
  *
  * 支持任意 base_url + api_key + model 组合（OpenAI / Azure / 本地部署）。
- * 自带重试和错误处理。
+ * 自带重试、超时与严格向量校验。
  */
 async function callEmbeddingAPI(
     texts: string[],
     config: EmbeddingConfig,
+    options?: EmbedOptions,
 ): Promise<Float32Array[]> {
     const baseUrl = config.baseUrl.replace(/\/$/, "");
     const model = config.model;
     const dimensions = config.dimensions;
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_EMBED_TIMEOUT_MS;
 
     log.debug("embed: API 调用", { count: texts.length, model, dimensions, baseUrl });
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        if (options?.signal?.aborted) {
+            throw options.signal.reason instanceof Error
+                ? options.signal.reason
+                : new DOMException("The operation was aborted", "AbortError");
+        }
+        options?.beforeAttempt?.();
         try {
+            const timeoutSignal = AbortSignal.timeout(timeoutMs);
+            const requestSignal = options?.signal
+                ? AbortSignal.any([options.signal, timeoutSignal])
+                : timeoutSignal;
+
             const response = await fetch(`${baseUrl}/embeddings`, {
                 method: "POST",
                 headers: {
@@ -81,32 +148,53 @@ async function callEmbeddingAPI(
                     input: texts,
                     dimensions,
                 }),
+                signal: requestSignal,
             });
 
             if (!response.ok) {
                 const body = await response.text().catch(() => "");
-                throw new Error(`Embedding API error ${response.status}: ${body}`);
+                throw createProviderHttpError("Embedding", response.status, response.statusText, body, response.headers);
             }
 
             const data = await response.json() as {
-                data: Array<{ embedding: number[]; index: number }>;
+                data?: Array<{ embedding?: unknown; index?: number }>;
             };
 
+            if (!Array.isArray(data?.data) || data.data.length !== texts.length) {
+                throw new Error(
+                    `Embedding API returned ${Array.isArray(data?.data) ? data.data.length : 0} vectors for ${texts.length} inputs`,
+                );
+            }
+
             // 按 index 排序确保顺序正确
-            const sorted = data.data.sort((a, b) => a.index - b.index);
-            return sorted.map(d => new Float32Array(d.embedding));
+            const sorted = [...data.data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+            return sorted.map((d, idx) => validateEmbeddingVector(d.embedding, dimensions, idx));
         } catch (err) {
-            const isRetryable = err instanceof Error && (
-                err.message.includes("429") ||
-                err.message.includes("500") ||
-                err.message.includes("502") ||
-                err.message.includes("503")
+            if (options?.signal?.aborted) {
+                throw err;
+            }
+            const status = (err as { status?: unknown })?.status;
+            const isAbort = err instanceof Error && err.name === "AbortError";
+            if (isAbort) {
+                throw err;
+            }
+            const isTimeout = err instanceof Error && err.name === "TimeoutError";
+            const isRetryable = isTimeout || status === 429 || status === 500 || status === 502 || status === 503 || (
+                err instanceof Error && (
+                    err.message.includes("429") ||
+                    err.message.includes("500") ||
+                    err.message.includes("502") ||
+                    err.message.includes("503")
+                )
             );
 
             if (isRetryable && attempt < MAX_RETRIES) {
-                const delay = RETRY_DELAYS[attempt] ?? 2000;
+                const retryAfterMs = (err as { retryAfterMs?: unknown })?.retryAfterMs;
+                const delay = typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs)
+                    ? Math.min(30_000, retryAfterMs)
+                    : (RETRY_DELAYS[attempt] ?? 2000);
                 log.warn("embed: API 重试", { attempt: attempt + 1, delay });
-                await new Promise(r => setTimeout(r, delay));
+                await sleepAbortable(delay, options?.signal);
                 continue;
             }
 

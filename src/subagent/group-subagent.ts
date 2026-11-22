@@ -354,7 +354,7 @@ export class GroupSubagent extends EventEmitter {
      */
     loadRecentTopics(memory: MemoryStoreV2): number {
         const since = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
-        const topicNodes = memory.getTopicsSince(this.chatId, since);
+        const topicNodes = memory.getTopicsSince(this.chatId, since, { liveOnly: true });
 
         if (topicNodes.length === 0) {
             log.debug("loadRecentTopics: 无最近话题", { chatId: this.chatId });

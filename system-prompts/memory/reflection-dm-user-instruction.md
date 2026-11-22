@@ -71,7 +71,9 @@
     {
       "userId": "string (用户ID)",
       "displayName": "string (当前显示名，如有变化)",
-      "aliases": ["string (昵称/别名，仅在有证据时谨慎更新)"]
+      "sourceMessageIds": ["证据消息 ID（本人明确自称或平台结构化 @ 提及绑定的原消息 ID）"],
+      "aliases": ["string (全局昵称/别名，仅在有该 userId 本人明确自称证据时谨慎更新，不要把旁人外号、调侃或单会话局部名称写成全局 aliases)"],
+      "chatNames": ["string (当前私聊内局部名称，可来自本人发送名、明确自称或平台结构化 @ 提及映射 `@显示名 [userId]`)"]
     }
   ],
   "groupUpdates": {
@@ -143,3 +145,4 @@
 - 不要重复添加已有事实中已存在的内容。
 - 私聊可能包含更深的个人信息，但仍只记录用户愿意在聊天中表达、未来有用且不敏感的信息。
 - 不确定的信息不要写，或者在 relationshipEvents 的 confidence 中体现不确定。
+- `identityUpdates` 中：当前会话内平台结构化 `@` 提及绑定到目标 `userId` 的显示名（`mentions[].displayName` / `@显示名 [userId]`）可作为 `chatNames` 的会话局部证据（需提供 `sourceMessageIds`）；绝不要把旁人调侃/外号或跨会话名称写成全局 `aliases`。

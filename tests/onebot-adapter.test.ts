@@ -81,6 +81,7 @@ describe("OneBotAdapter", () => {
             displayName: "BotName",
             isAll: false,
             isSelf: true,
+            nameSource: "chat",
         }]);
         assert.deepEqual(events[0].messageSegments, [
             { type: "text", data: { text: "hi " } },
@@ -553,6 +554,407 @@ describe("OneBotAdapter", () => {
         await waitForAsyncHandlers();
 
         assert.equal(events.length, 0);
+
+        nc.dispose();
+    });
+
+    it("isolates group member card cache across groups and private fallback", async () => {
+        const nc = makeNC();
+        const events = captureEvents(nc);
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+
+        // @ts-expect-error - override private method for test
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            if (action === "get_group_info") return { group_id: params.group_id, group_name: `Group-${params.group_id}` };
+            if (action === "get_stranger_info") return { user_id: params.user_id, nickname: "AccountNick" };
+            throw new Error(`unexpected action: ${action}`);
+        };
+
+        // User 777 speaks in Group 100 with card "Group100Card"
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 100,
+            user_id: 777,
+            message_id: 1,
+            sender: { user_id: 777, nickname: "AccountNick", card: "Group100Card" },
+            message: [{ type: "text", data: { text: "hello 100" } }],
+        }));
+        // User 777 speaks in Group 200 with card "Group200Card"
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 200,
+            user_id: 777,
+            message_id: 2,
+            sender: { user_id: 777, nickname: "AccountNick", card: "Group200Card" },
+            message: [{ type: "text", data: { text: "hello 200" } }],
+        }));
+        await waitForAsyncHandlers();
+
+        // Another user mentions 777 in Group 100 and Group 200 (should use each group's cached card, never cross-group!)
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 100,
+            user_id: 888,
+            message_id: 3,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 200,
+            user_id: 888,
+            message_id: 4,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        // Private message mentioning/from 777 should use account nickname, not group card!
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "private",
+            user_id: 888,
+            message_id: 5,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        await waitForAsyncHandlers();
+
+        assert.equal((events[2].mentions as any)[0].displayName, "Group100Card");
+        assert.equal((events[2].mentions as any)[0].nameSource, "chat");
+        assert.equal((events[3].mentions as any)[0].displayName, "Group200Card");
+        assert.equal((events[3].mentions as any)[0].nameSource, "chat");
+        assert.equal((events[4].mentions as any)[0].displayName, "AccountNick");
+        assert.equal(adapter.getCachedNames().userNicks.get("777"), "AccountNick");
+
+        nc.dispose();
+    });
+
+    it("handles group_card notice card_new, explicit clear, and omitted card non-downgrade", async () => {
+        const nc = makeNC();
+        const events = captureEvents(nc);
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        let memberLookups = 0;
+
+        // @ts-expect-error - override private method for test
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            if (action === "get_group_info") return { group_id: params.group_id, group_name: "G42" };
+            if (action === "get_group_member_info") {
+                memberLookups++;
+                return { user_id: params.user_id, card: "", nickname: "LookupNick" };
+            }
+            throw new Error(`unexpected action: ${action}`);
+        };
+
+        // 1. group_card notice with card_new updates group cache without polluting userNickCache
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "notice",
+            notice_type: "group_card",
+            group_id: 42,
+            user_id: 777,
+            card_new: "FreshCard",
+        }));
+        assert.equal(adapter.getCachedNames().userNicks.has("777"), false);
+
+        // 2. Message from 777 with omitted card field does NOT downgrade known card "FreshCard"
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 777,
+            message_id: 10,
+            sender: { user_id: 777, nickname: "RawNick" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        await waitForAsyncHandlers();
+        assert.equal((events[0].mentions as any)[0].displayName, "FreshCard");
+        assert.equal(memberLookups, 0);
+
+        // 3. Explicit empty card_new clears cache so subsequent mention re-fetches
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "notice",
+            notice_type: "group_card",
+            group_id: 42,
+            user_id: 777,
+            card_new: "",
+        }));
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 888,
+            message_id: 11,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        await waitForAsyncHandlers();
+        assert.equal(memberLookups, 1);
+        assert.equal((events[1].mentions as any)[0].displayName, "LookupNick");
+
+        nc.dispose();
+    });
+
+    it("guards async get_group_member_info against newer notice and prevents backfill from clobbering live cache", async () => {
+        const nc = makeNC();
+        const events = captureEvents(nc);
+        const adapter = new OneBotAdapter(makeConfig(), nc);
+        let resolveMemberLookup!: (value: unknown) => void;
+
+        // @ts-expect-error - override private method for test
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            if (action === "get_group_info") return { group_id: params.group_id, group_name: "G42" };
+            if (action === "get_group_member_info") {
+                return await new Promise(resolve => { resolveMemberLookup = resolve; });
+            }
+            throw new Error(`unexpected action: ${action}`);
+        };
+
+        // Start live message that triggers async get_group_member_info for 777
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 888,
+            message_id: 20,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        await waitForAsyncHandlers();
+
+        // While lookup is in-flight, a newer group_card notice arrives
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "notice",
+            notice_type: "group_card",
+            group_id: 42,
+            user_id: 777,
+            card_new: "NewerNoticeCard",
+        }));
+
+        // Stale async get_group_member_info resolves with older card
+        resolveMemberLookup({ user_id: 777, card: "StaleLookupCard", nickname: "OldNick" });
+        await waitForAsyncHandlers();
+
+        // Next mention must see "NewerNoticeCard" (not overwritten by stale lookup)
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 888,
+            message_id: 21,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        await waitForAsyncHandlers();
+        assert.equal((events[1].mentions as any)[0].displayName, "NewerNoticeCard");
+
+        // History backfill with old card must NOT clobber live cache "NewerNoticeCard"
+        // @ts-expect-error - invoke private normalizer with isHistoryBackfill
+        const backfilled = await adapter.normalizeIncomingMessage({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 777,
+            message_id: 5,
+            time: 1770000000,
+            sender: { user_id: 777, nickname: "OldNick", card: "AncientBackfillCard" },
+            message: [{ type: "text", data: { text: "old msg" } }],
+        }, { isHistoryBackfill: true });
+        assert.equal(backfilled?.displayName, "AncientBackfillCard");
+
+        // Live mention still sees "NewerNoticeCard"
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 888,
+            message_id: 22,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        await waitForAsyncHandlers();
+        assert.equal((events[2].mentions as any)[0].displayName, "NewerNoticeCard");
+
+        nc.dispose();
+    });
+
+    it("prevents blocked senders from poisoning mention cache and tags account_fallback when group lookup fails", async () => {
+        const nc = makeNC();
+        const events = captureEvents(nc);
+        const adapter = new OneBotAdapter(makeConfig(), nc, undefined, undefined, {
+            shouldCacheSender: ({ userId }) => userId !== "onebot:666",
+        });
+
+        // @ts-expect-error - override private method for test
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            if (action === "get_group_info") return { group_id: params.group_id, group_name: "G42" };
+            if (action === "get_group_member_info") throw new Error("not in group / lookup failed");
+            if (action === "get_stranger_info") return { user_id: params.user_id, nickname: "StrangerFallback" };
+            throw new Error(`unexpected action: ${action}`);
+        };
+
+        // Blocked sender 666 sends a spoofed card "SpoofedName"
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 666,
+            message_id: 30,
+            sender: { user_id: 666, nickname: "Blocked", card: "SpoofedName" },
+            message: [{ type: "text", data: { text: "blocked msg" } }],
+        }));
+        await waitForAsyncHandlers();
+
+        // Allowed user mentions 666: must NOT resolve "SpoofedName", falls back to get_stranger_info tagged as account_fallback
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 888,
+            message_id: 31,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "666" } }],
+        }));
+        await waitForAsyncHandlers();
+
+        assert.equal((events[1].mentions as any)[0].displayName, "StrangerFallback");
+        assert.equal((events[1].mentions as any)[0].nameSource, "account_fallback");
+
+        nc.dispose();
+    });
+
+    it("guards card-clear race, skips cache writes on backfill/blocked mentions, and tags poke account_fallback", async () => {
+        const nc = makeNC();
+        const events = captureEvents(nc);
+        const adapter = new OneBotAdapter(makeConfig(), nc, undefined, undefined, {
+            shouldCacheSender: ({ userId }) => userId !== "onebot:666",
+        });
+
+        let resolveLookup!: (value: unknown) => void;
+        // @ts-expect-error - override private method for test
+        adapter.callAction = async (action: string, params: Record<string, unknown>) => {
+            if (action === "get_group_info") return { group_id: params.group_id, group_name: "G42" };
+            if (action === "get_stranger_info") return { user_id: params.user_id, nickname: "StrangerNick" };
+            if (action === "get_group_member_info") {
+                if (String(params.user_id) === "777") {
+                    return await new Promise(resolve => { resolveLookup = resolve; });
+                }
+                if (String(params.user_id) === "999") {
+                    return { user_id: 999, card: "BlockedTargetCard", nickname: "Nick999" };
+                }
+                if (String(params.user_id) === "998") {
+                    return { user_id: 998, card: "BackfillTargetCard", nickname: "Nick998" };
+                }
+                throw new Error("member lookup failed");
+            }
+            throw new Error(`unexpected action: ${action}`);
+        };
+
+        // 1. Card-clear race: start lookup for 777, then clear via group_card notice card_new="" before lookup resolves
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 888,
+            message_id: 40,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "777" } }],
+        }));
+        await waitForAsyncHandlers();
+
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "notice",
+            notice_type: "group_card",
+            group_id: 42,
+            user_id: 777,
+            card_new: "",
+        }));
+        resolveLookup({ user_id: 777, card: "ClearedStaleCard", nickname: "ClearedStaleNick" });
+        await waitForAsyncHandlers();
+
+        // Must NOT use ClearedStaleCard as nameSource="chat"; falls back to account_fallback
+        assert.notEqual((events[0].mentions as any)[0].displayName, "ClearedStaleCard");
+        assert.equal((events[0].mentions as any)[0].nameSource, "account_fallback");
+
+        // 2. Blocked sender's mention enrichment must NOT populate groupMemberNameCache
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 666,
+            message_id: 41,
+            sender: { user_id: 666, nickname: "Blocked" },
+            message: [{ type: "at", data: { qq: "999" } }],
+        }));
+        await waitForAsyncHandlers();
+        assert.equal((adapter as any).groupMemberNameCache.get("42")?.has("999") ?? false, false);
+
+        // 3. Backfill mention enrichment must NOT populate groupMemberNameCache or userNickCache
+        // @ts-expect-error - invoke private normalizer with isHistoryBackfill
+        await adapter.normalizeIncomingMessage({
+            post_type: "message",
+            self_id: "123456789",
+            message_type: "group",
+            group_id: 42,
+            user_id: 888,
+            message_id: 42,
+            time: 1770000100,
+            sender: { user_id: 888, nickname: "Bob" },
+            message: [{ type: "at", data: { qq: "998" } }],
+        }, { isHistoryBackfill: true });
+        assert.equal((adapter as any).groupMemberNameCache.get("42")?.has("998") ?? false, false);
+
+        // 4. Group poke falling back to stranger nickname preserves displayNameSource="account_fallback"
+        // @ts-expect-error - invoke private handler
+        adapter.handleWsMessage(JSON.stringify({
+            post_type: "notice",
+            notice_type: "notify",
+            sub_type: "poke",
+            self_id: "123456789",
+            group_id: 42,
+            user_id: 555,
+            target_id: 123456789,
+            time: 1770000200,
+        }));
+        await waitForAsyncHandlers();
+        const pokeEvt = events.find(e => String(e.messageId ?? "").startsWith("poke_"));
+        assert.ok(pokeEvt);
+        assert.equal(pokeEvt.displayName, "StrangerNick");
+        assert.equal(pokeEvt.displayNameSource, "account_fallback");
 
         nc.dispose();
     });

@@ -19,7 +19,7 @@ import { createLogger } from "../core/logger.js";
 import { callLLMWithFallback, type ChatMessage } from "../core/llm.js";
 import { loadConfig, resolveComponentProfiles, resolveComponentTimeout, type LLMConfig, type VisionConfig } from "../core/config.js";
 import { topicClusteringProvider, topicTriageProvider } from "../context-engine/providers/pipeline-providers.js";
-import type { MemoryStoreV2, RecentMessageEntry } from "../memory-v2/index.js";
+import { computeStatsHour, type MemoryStoreV2, type RecentMessageEntry } from "../memory-v2/index.js";
 import { embed } from "../memory-v2/embedding.js";
 import type { EmbeddingConfig } from "../core/config.js";
 import type { TopicRegistry } from "./topic-registry.js";
@@ -308,55 +308,35 @@ export class RecordingPipeline extends EventEmitter {
                         });
                     }
 
-                    // 批量写入原始消息到 message_log
-                    this.memory.storeMessageBatch(chatMessages.map(m => ({
-                        messageId: m.id,
-                        chatId: String(m.chatId),
-                        userId: ensureCompositeId(getPlatform(chatId), String(m.senderId)),
-                        displayName: m.senderName,
-                        text: m.text,
-                        mentions: m.mentions,
-                        replyToMessageId: m.replyToMessageId,
-                        timestamp: new Date(m.timestamp).toISOString(),
-                        mediaType: m.mediaType,
-                        mediaInfo: m.mediaInfo,
-                    })));
-
-                    // 更新参与者身份信息 + 群内画像统计
+                    // 统一入库兜底（幂等：main.ts 已实时写入的消息自动去重不重复计入统计；
+                    // 未经过 main.ts 的调用方由这里补齐 message_log / person_chat_names / 统计）
+                    const isOneBotGroup = String(chatId).startsWith("onebot:group:");
                     const seenUsers = new Set<string>();
-                    const userStats = new Map<string, { count: number; hours: number[]; lastTs: string }>();
-
-                    for (const m of chatMessages) {
-                        if (!seenUsers.has(m.senderId)) {
-                            seenUsers.add(m.senderId);
-                            this.memory.upsertPersonIdentity(ensureCompositeId(getPlatform(chatId), String(m.senderId)), {
-                                displayName: m.senderName,
-                                ...(m.senderUsername ? { username: m.senderUsername } : {}),
-                                lastSeenAt: new Date(m.timestamp).toISOString(),
-                            });
-                        }
-
-                        // 累计每用户的消息统计
-                        let s = userStats.get(m.senderId);
-                        if (!s) {
-                            s = { count: 0, hours: new Array(24).fill(0), lastTs: "" };
-                            userStats.set(m.senderId, s);
-                        }
-                        s.count++;
-                        const hour = new Date(m.timestamp).getHours();
-                        s.hours[hour]++;
-                        const ts = new Date(m.timestamp).toISOString();
-                        if (ts > s.lastTs) s.lastTs = ts;
-                    }
-
-                    // 批量更新群内画像统计（messageCount/activeHours/lastSeenAt）
-                    for (const [uid, s] of userStats) {
-                        this.memory.incrementProfileStats(ensureCompositeId(getPlatform(chatId), String(uid)), String(chatId), {
-                            messageCountDelta: s.count,
-                            activeHoursDelta: s.hours,
-                            lastSeenAt: s.lastTs,
-                        });
-                    }
+                    this.memory.storeIngestedBatch(chatMessages.map(m => {
+                        seenUsers.add(m.senderId);
+                        const isAgentSelf = m.senderId === this.personaName || m.senderId === "agent";
+                        const isoTs = new Date(m.timestamp).toISOString();
+                        const userId = isAgentSelf
+                            ? m.senderId
+                            : ensureCompositeId(getPlatform(chatId), String(m.senderId));
+                        return {
+                            messageId: m.id,
+                            chatId: String(m.chatId),
+                            userId,
+                            displayName: m.senderName,
+                            text: m.text,
+                            mentions: m.mentions,
+                            replyToMessageId: m.replyToMessageId,
+                            timestamp: isoTs,
+                            mediaType: m.mediaType,
+                            mediaInfo: m.mediaInfo,
+                            origin: "live" as const,
+                            countAsHuman: !isAgentSelf,
+                            statsHour: isAgentSelf ? null : computeStatsHour(m.timestamp),
+                            globalDisplayName: isOneBotGroup ? undefined : (m.senderName || undefined),
+                            username: m.senderUsername,
+                        };
+                    }));
 
                     if (!clusterOnly) {
                         this.publishSignals(chatId, signalReadyTopics, topicMessagesById);
@@ -937,7 +917,8 @@ export class RecordingPipeline extends EventEmitter {
         const sections: string[] = [];
 
         // --- 群组信息 ---
-        const groupModel = this.memory.getGroupModel(getGroupModelKey(chatId));
+        const groupModel = this.memory.getGroupCultureModel?.(chatId)
+            ?? this.memory.getGroupModel(getGroupModelKey(chatId));
         if (groupModel) {
             const isDirectMessage = !!groupModel.isDirectMessage;
             if (isDirectMessage) {
@@ -968,7 +949,7 @@ export class RecordingPipeline extends EventEmitter {
                 const identity = this.memory!.getPersonIdentity(p.userId);
                 const namePart = identity?.username ? ` (@${identity.username})` : "";
                 const parts = [
-                    `- **${this.formatUserLabel(p.userId)}**${namePart}`,
+                    `- **${this.formatUserLabel(p.userId, p.displayName, chatId)}**${namePart}`,
                     "关系：" + getDunbarTierLabel(p.dunbarTier),
                     p.traits.length ? `traits=[${p.traits.join(", ")}]` : null,
                     p.interests.length ? `interests=[${p.interests.join(", ")}]` : null,
@@ -983,7 +964,12 @@ export class RecordingPipeline extends EventEmitter {
         if (relevantProfiles.length > 0) {
             const factLines: string[] = [];
             for (const p of relevantProfiles) {
-                const result = this.memory!.listCoreFacts({ subject: p.userId, limit: 5 });
+                const result = this.memory!.listCoreFacts({
+                    subject: p.userId,
+                    limit: 5,
+                    authorizedChatId: chatId,
+                    includeAllHistory: false,
+                });
                 for (const f of result.items) {
                     const source = f.sourceChatId
                         ? ` 来源: ${this.formatChatLabel(f.sourceChatId, f.sourceChatTitle)}`
@@ -992,7 +978,7 @@ export class RecordingPipeline extends EventEmitter {
                             : "";
                     const topic = f.sourceTopicLabel ? ` / 话题: ${f.sourceTopicLabel}` : "";
                     const boundary = [f.visibility, f.sensitivity].filter(Boolean).join("/");
-                    factLines.push(`- (${f.category}) ${this.formatUserLabel(f.subject)}: ${f.content}${source}${topic}${boundary ? ` (${boundary})` : ""}`);
+                    factLines.push(`- (${f.category}) ${this.formatUserLabel(f.subject, p.displayName, chatId)}: ${f.content}${source}${topic}${boundary ? ` (${boundary})` : ""}`);
                 }
             }
             if (factLines.length > 0) {
@@ -1003,9 +989,10 @@ export class RecordingPipeline extends EventEmitter {
         return sections;
     }
 
-    private formatUserLabel(userId: string): string {
+    private formatUserLabel(userId: string, fallbackDisplayName?: string, chatId?: string): string {
+        const chatName = chatId ? this.memory?.getChatDisplayName?.(chatId, userId) : null;
         const identity = this.memory?.getPersonIdentity(userId);
-        const name = identity?.displayName?.trim() || userId;
+        const name = chatName?.trim() || fallbackDisplayName?.trim() || identity?.displayName?.trim() || userId;
         return `${name}(${userId})`;
     }
 
@@ -1024,9 +1011,10 @@ export class RecordingPipeline extends EventEmitter {
         }
 
         const query = topic.keywords.join(" ");
-        const facts = this.memory.searchFacts(query, { limit: 15 });
+        const facts = this.memory.searchFacts(query, { limit: 15, authorizedChatId: chatId });
         const topics = this.memory.searchTopics(query, {
             chatId,
+            authorizedChatId: chatId,
             limit: 10,
             excludeTopicIds: [topic.id],
         }).filter((candidate) => candidate.startedAt < new Date(topic.createdAt).toISOString());

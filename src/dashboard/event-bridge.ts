@@ -475,7 +475,7 @@ export class EventBridge {
         const includedChatIds = new Set<string>();
         for (const sub of subagentManager.getAllSubagents()) {
             const gm = this.deps.memory.getGroupModel(getGroupModelKey(sub.chatId));
-            const lastMessageAt = this.deps.memory.getRecentMessages(sub.chatId, 1)[0]?.timestamp ?? "";
+            const lastMessageAt = this.deps.memory.getRecentMessages(sub.chatId, 1, { includeBlocked: true })[0]?.timestamp ?? "";
             const pendingBlockedMessages = this.deps.memory.countPendingAccessControlMessages(sub.chatId);
             groups.push({
                 chatId: sub.chatId,
@@ -504,7 +504,7 @@ export class EventBridge {
         for (const chatId of this.deps.memory.listKnownChatIds()) {
             if (includedChatIds.has(chatId)) continue;
             const gm = this.deps.memory.getGroupModel(getGroupModelKey(chatId));
-            const lastMessageAt = this.deps.memory.getRecentMessages(chatId, 1)[0]?.timestamp ?? "";
+            const lastMessageAt = this.deps.memory.getRecentMessages(chatId, 1, { includeBlocked: true })[0]?.timestamp ?? "";
             const pendingBlockedMessages = this.deps.memory.countPendingAccessControlMessages(chatId);
             groups.push({
                 chatId,

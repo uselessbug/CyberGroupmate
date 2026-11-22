@@ -12,6 +12,93 @@
 
 import type { LLMConfig, ReflectionExternalConfig } from "../core/config.js";
 import type { MessageMention } from "../core/message-provenance.js";
+import type { ChatNameHit, ChatNameKind, ChatNameObservation, LatestChatNameRecord } from "./chat-names.js";
+import type {
+    ChatActivityStats,
+    EditHistoryFactInput,
+    EditHistoryFactResult,
+    HistoryCheckpoint,
+    HistoryClusterCommitInput,
+    HistoryClusterCommitResult,
+    HistoryClusterTopicInput,
+    HistoryDashboardFactItem,
+    HistoryEmbeddingCommitInput,
+    HistoryFactEvidenceResult,
+    HistoryFactKind,
+    HistoryFactReviewAction,
+    HistoryFactReviewStatus,
+    HistoryFactSort,
+    HistoryFinalizeQceImportInput,
+    HistoryJobKind,
+    HistoryJobRecord,
+    HistoryJobStatus,
+    HistoryLease,
+    HistoryOverviewChatRecord,
+    HistorySynthesisCitation,
+    HistorySynthesisCommitInput,
+    HistorySynthesisCommitResult,
+    HistorySynthesisEpisodeInput,
+    HistorySynthesisExpectedEvidence,
+    HistorySynthesisFactProposal,
+    HistorySynthesisGroupPatch,
+    HistorySynthesisMemberPatch,
+    HistorySynthesisProtectionData,
+    HistoryUnitInput,
+    HistoryUnitRecord,
+    HistoryUnitStage,
+    IngestBatchResult,
+    IngestMessage,
+    ListHistoryFactsOptions,
+    ListHistoryFactsResult,
+    MemeVariantUsageCounts,
+    MessageOrigin,
+    UpsertHistoryJobInput,
+} from "./history-store.js";
+
+export type {
+    ChatActivityStats,
+    ChatNameHit,
+    ChatNameKind,
+    ChatNameObservation,
+    EditHistoryFactInput,
+    EditHistoryFactResult,
+    HistoryCheckpoint,
+    HistoryClusterCommitInput,
+    HistoryClusterCommitResult,
+    HistoryClusterTopicInput,
+    HistoryDashboardFactItem,
+    HistoryEmbeddingCommitInput,
+    HistoryFactEvidenceResult,
+    HistoryFactKind,
+    HistoryFactReviewAction,
+    HistoryFactReviewStatus,
+    HistoryFactSort,
+    HistoryFinalizeQceImportInput,
+    HistoryJobKind,
+    HistoryJobRecord,
+    HistoryJobStatus,
+    HistoryLease,
+    HistoryOverviewChatRecord,
+    HistorySynthesisCitation,
+    HistorySynthesisCommitInput,
+    HistorySynthesisCommitResult,
+    HistorySynthesisEpisodeInput,
+    HistorySynthesisExpectedEvidence,
+    HistorySynthesisFactProposal,
+    HistorySynthesisGroupPatch,
+    HistorySynthesisMemberPatch,
+    HistorySynthesisProtectionData,
+    HistoryUnitInput,
+    HistoryUnitRecord,
+    HistoryUnitStage,
+    IngestBatchResult,
+    IngestMessage,
+    ListHistoryFactsOptions,
+    ListHistoryFactsResult,
+    MemeVariantUsageCounts,
+    MessageOrigin,
+    UpsertHistoryJobInput,
+};
 
 // ─── 事实分类 ───
 
@@ -86,6 +173,8 @@ export interface TopicNode {
     associatedMemories?: AssociatedMemory[];
     /** 触发回梗/主动接话的潜力分（0-100） */
     callbackPotential?: number;
+    /** 离线历史聚类幂等键（仅历史初始化话题非空） */
+    historyKey?: string | null;
     /** 向量表示（语义检索用，Phase M4） */
     embedding?: Float32Array;
     /** 创建时间 (ISO 8601) */
@@ -230,6 +319,8 @@ export interface InteractionEpisode {
     mediaTypes?: string[];
     /** 回复链目标消息 ID */
     replyToMessageIds?: string[];
+    /** 记录来源（实时反思 vs 离线历史初始化） */
+    origin?: "live" | "offline_history";
 }
 
 /** 合并后的记忆（周/月/季度/年粒度） */
@@ -365,6 +456,10 @@ export interface CoreFact {
     visibility?: "private" | "contextual" | "public";
     /** 敏感度 */
     sensitivity?: "low" | "medium" | "high";
+    /** 离线历史综合幂等键（仅离线历史事实非空） */
+    historyKey?: string | null;
+    /** 离线历史事实审核状态 */
+    historyReview?: "approved" | null;
     /** 向量表示 */
     embedding?: Float32Array;
     /** 创建时间 (ISO 8601) */
@@ -391,6 +486,10 @@ export interface RecallOptions {
     categories?: FactCategory[];
     /** 结果 token 超过此值时启用 cheap model 深度总结 */
     deepRecallThreshold?: number;
+    /** 授权读取历史记忆的会话 ID（默认取 chatId；未提供时不返回历史事实/话题） */
+    authorizedChatId?: string;
+    /** 管理员/Dashboard 显式放行跨会话历史记忆（默认 false） */
+    includeAllHistory?: boolean;
 }
 
 /** recall() 的返回结果 */
@@ -560,6 +659,8 @@ export interface TimelineOptions {
     limit?: number;
     includeTopics?: boolean;
     includeDigests?: boolean;
+    authorizedChatId?: string;
+    includeAllHistory?: boolean;
 }
 
 export interface TimelineEntry {
@@ -591,6 +692,12 @@ export interface HistoryBrowseRequest {
     contextWindow?: number;
     /** 最大结果数，默认 3 */
     maxSegments?: number;
+    /** 授权读取历史话题的会话 ID */
+    authorizedChatId?: string;
+    /** 管理员/Dashboard 显式放行跨会话历史话题（默认 false） */
+    includeAllHistory?: boolean;
+    /** 跳过 LLM 意图解析，仅用分词检索（测试/离线可用） */
+    skipIntentLlm?: boolean;
 }
 
 /** 消息档案检索结果 */
@@ -662,6 +769,8 @@ export interface MessageLogEntry {
     mediaInfo?: string;
     /** 消息到达时是否被全局访问控制拦截 */
     accessControlBlocked?: boolean;
+    /** 发送者显示名的来源可信度（用于合成消息如 poke 的 account_fallback 标记） */
+    displayNameSource?: "chat" | "account_fallback" | "qce";
 }
 
 export interface RecentMessageEntry {
@@ -707,6 +816,66 @@ export interface IMemoryStoreV2 {
     /** 批量写入原始消息到 message_log 表 */
     storeMessageBatch(messages: MessageLogEntry[]): void;
 
+    /** 统一历史/实时消息写入路径（含去重、chat_names 投影、精确一次统计） */
+    storeIngestedBatch(entries: IngestMessage[], checkpoint?: HistoryCheckpoint): IngestBatchResult;
+
+    /** 获取/续租/释放按会话隔离的历史任务租约 */
+    acquireHistoryLease(chatId: string, ttlMs?: number): HistoryLease;
+    renewHistoryLease(chatId: string, ownerToken: string, ttlMs?: number): number;
+    releaseHistoryLease(chatId: string, ownerToken: string): void;
+
+    /** 历史导入/初始化作业检查点管理 */
+    getHistoryJob(kind: HistoryJobKind, chatId: string, inputKey: string): HistoryJobRecord | null;
+    findLatestHistoryJob(kind: HistoryJobKind, chatId: string): HistoryJobRecord | null;
+    upsertHistoryJob(job: UpsertHistoryJobInput, ownerToken?: string): HistoryJobRecord;
+    updateHistoryJobStatus(
+        jobId: string,
+        ownerToken: string,
+        status: HistoryJobStatus,
+        progress?: Record<string, unknown> | string,
+    ): HistoryJobRecord;
+
+    /** 历史处理单元检查点与原子提交 */
+    upsertHistoryUnits(jobId: string, stage: HistoryUnitStage, units: HistoryUnitInput[], ownerToken: string): void;
+    listHistoryUnits(jobId: string, stage: HistoryUnitStage): HistoryUnitRecord[];
+    markHistoryUnitCompleted(
+        jobId: string,
+        ownerToken: string,
+        stage: HistoryUnitStage,
+        unitKey: string,
+        outputJson: string,
+    ): HistoryUnitRecord;
+    getCoveredMessageIds(chatId: string): Set<string>;
+    countChatMemeVariantUsage(chatId: string, variants: readonly string[]): MemeVariantUsageCounts;
+    getHistoricalTopicsForChat(chatId: string): TopicNode[];
+    commitHistoricalClusterUnit(input: HistoryClusterCommitInput): HistoryClusterCommitResult;
+    commitHistoricalSynthesisUnit(input: HistorySynthesisCommitInput): HistorySynthesisCommitResult;
+    commitHistoricalEmbeddingUnit(input: HistoryEmbeddingCommitInput): void;
+    getHistoryLease(chatId: string): HistoryLease | null;
+    listCompletedHistoryUnitKeys(chatId: string, kind: HistoryJobKind, stage: HistoryUnitStage): Set<string>;
+    getSynthesisProtectionData(chatId: string): HistorySynthesisProtectionData;
+    listHistoryFacts(options: ListHistoryFactsOptions): ListHistoryFactsResult;
+    reviewHistoryFacts(chatId: string, action: HistoryFactReviewAction, historyKeys: readonly string[]): number;
+    editHistoryFact(input: EditHistoryFactInput): EditHistoryFactResult;
+    getHistoryFactEvidence(chatId: string, historyKey: string): HistoryFactEvidenceResult | null;
+    getHistoryOverviewChats(activeRunnerChatId: string | null): HistoryOverviewChatRecord[];
+    finalizeQceImport(input: HistoryFinalizeQceImportInput): ChatActivityStats | null;
+
+    /** 从 message_log 重算并仅更新 group_models 活动统计字段 */
+    recomputeChatActivityStats(chatId: string, timezone?: string): ChatActivityStats;
+
+    /** 写入群内名称观察记录 */
+    insertChatNameObservations(observations: ChatNameObservation[]): number;
+
+    /** 在指定会话内按归一化名称检索人名 */
+    searchChatNames(chatId: string, query: string, limit?: number): ChatNameHit[];
+
+    /** 获取指定会话内某用户的最新显示名 */
+    getChatDisplayName(chatId: string, userId: string): string | null;
+
+    /** 批量获取指定会话内多用户的最新显示名 */
+    getChatDisplayNames(chatId: string, userIds?: string[]): Map<string, string>;
+
     /** 写入核心事实到 core_facts 表 */
     storeFact(subject: string, content: string, category: FactCategory, source?: string, expiresAt?: string, embedding?: Float32Array, confidence?: number, provenance?: CoreFactProvenance): string;
 
@@ -738,6 +907,12 @@ export interface IMemoryStoreV2 {
     /** 获取群组画像 */
     getGroupModel(chatId: string): GroupModel | null;
 
+    /** 获取合并精确会话文化叠加层后的群组画像（主要用于 Discord guild + channel 文化叠层） */
+    getGroupCultureModel?(chatId: string): GroupModel | null;
+
+    /** 判断某条核心事实是否受历史初始化保护（history_key IS NOT NULL） */
+    isHistoricalFact?(id: string): boolean;
+
     /**
      * 将某会话标记为敏感/私密（append-only：只置 true、幂等、无取消路径）。
      * 用于全局 visibility 兜底；标记后该会话按 private 处理。
@@ -760,10 +935,20 @@ export interface IMemoryStoreV2 {
     countInteractionsPerChat(days?: number): Map<string, { interactionCount: number; activeDays: number; lastInteractionAt: string | null }>;
 
     /** 向量搜索 topics（纯 JS 余弦相似度） */
-    vectorSearchTopics(queryEmbedding: Float32Array, limit?: number, chatId?: string): Array<TopicNode & { similarity: number }>;
+    vectorSearchTopics(
+        queryEmbedding: Float32Array,
+        limit?: number,
+        chatId?: string,
+        options?: { authorizedChatId?: string; includeAllHistory?: boolean },
+    ): Array<TopicNode & { similarity: number }>;
 
     /** 向量搜索 core_facts（纯 JS 余弦相似度）。返回 visibility/sourceChatId 供 chokepoint scrub。 */
-    vectorSearchFacts(queryEmbedding: Float32Array, limit?: number, categories?: FactCategory[]): Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number; visibility?: "private" | "contextual" | "public"; sourceChatId?: string | null }>;
+    vectorSearchFacts(
+        queryEmbedding: Float32Array,
+        limit?: number,
+        categories?: FactCategory[],
+        options?: { authorizedChatId?: string; includeAllHistory?: boolean },
+    ): Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number; visibility?: "private" | "contextual" | "public"; sourceChatId?: string | null }>;
 
     /** 写入一条永久 session digest / agent consciousness memory */
     appendSessionDigest(entry: Omit<SessionDigestEntry, "id" | "createdAt"> & { id?: string; createdAt?: string; embedding?: Float32Array }): SessionDigestEntry;
@@ -796,13 +981,13 @@ export interface IMemoryStoreV2 {
     browseHistory(request: HistoryBrowseRequest): Promise<HistoryBrowseResult>;
 
     /** 获取指定 chatId 在 since 之后的 topics */
-    getTopicsSince(chatId: string, since: string): TopicNode[];
+    getTopicsSince(chatId: string, since: string, options?: { liveOnly?: boolean }): TopicNode[];
 
     /** 获取指定 chatId 最近 N 条 topics（按 started_at DESC，无时间限制） */
-    getRecentTopics(chatId: string, limit?: number): TopicNode[];
+    getRecentTopics(chatId: string, limit?: number, options?: { liveOnly?: boolean }): TopicNode[];
 
     /** 通过持久化 topic id 获取单条话题 */
-    getTopicById(topicId: string): TopicNode | null;
+    getTopicById(topicId: string, options?: { liveOnly?: boolean; chatId?: string }): TopicNode | null;
 
     /** 获取指定 chatId 在 since 之后的 interactions */
     getInteractionsSince(chatId: string, since: string): InteractionEpisode[];
@@ -814,7 +999,7 @@ export interface IMemoryStoreV2 {
     getProfilesForUser(userId: string): PersonGroupProfile[];
 
     /** 获取指定 chatId 最近的原始消息 */
-    getRecentMessages(chatId: string, limit?: number): RecentMessageEntry[];
+    getRecentMessages(chatId: string, limit?: number, options?: { includeBlocked?: boolean }): RecentMessageEntry[];
 
     /** 获取尚未通过 Dashboard 放行的访问控制积压消息（最新在前） */
     getPendingAccessControlMessages(chatId: string, limit?: number): RecentMessageEntry[];
@@ -831,6 +1016,9 @@ export interface IMemoryStoreV2 {
     /** message_log 中出现过的会话（可按平台前缀过滤） */
     listKnownChatIds(platformPrefix?: string): string[];
 
+    /** 仅包含非 QCE 导入消息的会话（供启动补抓隔离） */
+    listBackfillChatIds(platformPrefix?: string): string[];
+
     /** 获取已缓存的 sticker 描述（只读，用于上下文富化；enabled 表示是否在发送允许列表中） */
     getStickerDescription(uniqueFileId: string, contentHash?: string): { description: string; emoji?: string; emojis?: string[]; enabled: boolean } | null;
 
@@ -839,6 +1027,8 @@ export interface IMemoryStoreV2 {
         subject?: string;
         categories?: FactCategory[];
         limit?: number;
+        authorizedChatId?: string;
+        includeAllHistory?: boolean;
     }): FactSearchResult[];
 
     /** 搜索历史话题 */
@@ -848,6 +1038,8 @@ export interface IMemoryStoreV2 {
         before?: string;
         excludeTopicIds?: string[];
         limit?: number;
+        authorizedChatId?: string;
+        includeAllHistory?: boolean;
     }): TopicSearchResult[];
 
     /** 搜索聊天记录原文 */
@@ -863,7 +1055,10 @@ export interface IMemoryStoreV2 {
     queryMessages(options?: MessageQueryOptions): MessageSearchResult[];
 
     /** 获取用户完整画像检索结果 */
-    getUserProfile(userId: string, chatId?: string): UserProfileSearchResult;
+    getUserProfile(userId: string, chatId?: string, options?: {
+        authorizedChatId?: string;
+        includeAllHistory?: boolean;
+    }): UserProfileSearchResult;
 
     /** 获取近期交互日志 */
     getRecentInteractions(chatId?: string | null, userId?: string, limit?: number): InteractionSearchResult[];
@@ -912,9 +1107,15 @@ export interface IMemoryStoreV2 {
     todoRemove(chatId: string, key: string): void;
 
     /** 按 messageId 查询单条消息（用于获取不在上下文窗口中的被回复消息） */
-    getMessageById(chatId: string, messageId: string): RecentMessageEntry | null;
-    getMessagesByIds(chatId: string, messageIds: string[]): RecentMessageEntry[];
-    getMessagesBetweenIds(chatId: string, startMessageId: string, endMessageId: string): RecentMessageEntry[];
+    getMessageById(chatId: string, messageId: string, options?: { includeBlocked?: boolean }): RecentMessageEntry | null;
+    getMessagesByIds(chatId: string, messageIds: string[], options?: { includeBlocked?: boolean }): RecentMessageEntry[];
+    getMessagesBetweenIds(chatId: string, startMessageId: string, endMessageId: string, options?: { includeBlocked?: boolean }): RecentMessageEntry[];
+    getLatestChatNameForUser?(chatId: string, userId: string): LatestChatNameRecord | null;
+    commitMergedEpisodes?(
+        userId: string,
+        chatId: string,
+        input: { removedLiveEpisodeIds: string[]; mergedMemory: MergedMemory[] },
+    ): void;
 
     /**
      * 对指定群组进行反思总结

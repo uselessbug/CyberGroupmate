@@ -11,11 +11,7 @@
  */
 
 import { createInterface } from "node:readline";
-import { Sandbox } from "./sandbox/sandbox.js";
-import { NotificationCenter } from "./event/notification-center.js";
-import { MemoryStoreV2 } from "./memory-v2/index.js";
-import { createMemoryStore } from "./core/memory-factory.js";
-import { loadConfig, resolveComponentProfiles, resolveEmbeddingConfig } from "./core/config.js";
+import type { Sandbox } from "./sandbox/sandbox.js";
 import { createLogger } from "./core/logger.js";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -35,6 +31,7 @@ const DATA_DIR = "workspace";
 async function cmdSandbox(): Promise<void> {
     log.info("启动 Sandbox REPL...");
 
+    const { Sandbox } = await import("./sandbox/sandbox.js");
     const sandbox = new Sandbox();
     await sandbox.start();
     log.info("Sandbox 就绪。输入 TypeScript 代码执行，输入 .exit 退出。");
@@ -159,6 +156,7 @@ async function executeAndPrint(sandbox: Sandbox, code: string): Promise<void> {
  *   notify [type] [text]
  */
 async function cmdNotify(args: string[]): Promise<void> {
+    const { NotificationCenter } = await import("./event/notification-center.js");
     const eventsPath = join(DATA_DIR, "events.jsonl");
     const nc = new NotificationCenter(eventsPath, false);
 
@@ -193,6 +191,8 @@ async function cmdMemory(args: string[]): Promise<void> {
         process.exit(1);
     }
 
+    const { loadConfig, resolveComponentProfiles, resolveEmbeddingConfig } = await import("./core/config.js");
+    const { createMemoryStore } = await import("./core/memory-factory.js");
     const cfg = loadConfig();
     // 其它命令遵循 embedding.enabled 开关（关 → undefined，走关键词召回、不打 embedding API）；
     // backfill-embeddings 是「为日后启用做准备」的显式操作，即便当前 enabled=false 也强制用配置的 embedding。
@@ -348,6 +348,7 @@ async function cmdMemory(args: string[]): Promise<void> {
 async function cmdConfig(): Promise<void> {
     log.info("加载配置...");
 
+    const { loadConfig } = await import("./core/config.js");
     const config = loadConfig(undefined, true);
 
     console.log("\n\x1b[1mLLM Profiles：\x1b[0m");
@@ -457,6 +458,7 @@ async function cmdStatus(): Promise<void> {
     // Memory stats —— 仅读取本地 SQLite（不经检索后端），保证离线/任意 backend 配置下都可用
     const dbPath = join(DATA_DIR, "memory.db");
     if (existsSync(dbPath)) {
+        const { MemoryStoreV2 } = await import("./memory-v2/index.js");
         const memory = new MemoryStoreV2(dbPath);
         try {
             const db = (memory as any).db;
@@ -488,6 +490,7 @@ const HELP = `
   sandbox                交互式 Sandbox REPL
   notify [type] [text]   推送一条通知到队列
   memory <subcmd>        记忆系统查询（recall/browse/reflect/status）
+  history <subcmd>       离线历史导入与社会记忆初始化（import/init）
   config                 检查配置加载结果
   status                 查看 agent 运行状态和统计
 
@@ -500,6 +503,12 @@ async function main(): Promise<void> {
     const [_node, _script, command, ...args] = process.argv;
 
     switch (command) {
+        case "history": {
+            const { runHistoryCli } = await import("./history/cli.js");
+            const exitCode = await runHistoryCli(args);
+            process.exitCode = exitCode;
+            break;
+        }
         case "sandbox":
             await cmdSandbox();
             break;

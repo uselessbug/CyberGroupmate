@@ -42,7 +42,7 @@ export interface MetaSessionHandlerDeps {
     getPersona: () => { name?: string; description?: string } | undefined;
     globalState: Pick<GlobalState, "getSessionDigests" | "getMetaSessionHistory" | "appendMetaSessionHistory">;
     memory: Pick<IMemoryStoreV2, "getGroupModel" | "getProfilesForChat" | "getPersonIdentity" | "getTopicById" | "todoList" | "getRecentMessages">
-        & Partial<Pick<IMemoryStoreV2, "getStickerDescription">>;
+        & Partial<Pick<IMemoryStoreV2, "getStickerDescription" | "getGroupCultureModel">>;
     sandbox: MetaSandbox;
     setActiveUserProfilesForDispatch?: (profilesByChatId: Map<string, ActiveUserProfile[]>) => void;
     getLlmConfigs: () => LLMConfig[];
@@ -405,7 +405,7 @@ async function buildMetaResolveContext(
     const isSyntheticMeta = entry.chatId === "__meta__";
     const groupModel = isSyntheticMeta
         ? null
-        : deps.memory.getGroupModel(getGroupModelKey(entry.chatId));
+        : (deps.memory.getGroupCultureModel?.(entry.chatId) ?? deps.memory.getGroupModel(getGroupModelKey(entry.chatId)));
     const topicDigests = enrichTopicDigests(entry.topicDigests, deps.memory);
 
     const isDirectMessage = groupModel?.isDirectMessage ?? inferDirectMessageFromChatId(entry.chatId) ?? entry.directAddressReason === "DM";

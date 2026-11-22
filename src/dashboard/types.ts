@@ -45,6 +45,8 @@ export interface DashboardDeps {
     harnessManager?: import("../harness/manager.js").HarnessManager;
     /** Post-task window 管理器（手动注入注意力时立即结算进行中的窗口） */
     postTaskWindows?: Pick<PostTaskWindowManager, "forceFlush" | "hasActiveWindow">;
+    /** 历史初始化进程内运行器 */
+    historyRunner?: import("../history/runner.js").HistoryInitRunner;
 }
 
 /** Dashboard 配置 */

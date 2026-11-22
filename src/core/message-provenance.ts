@@ -3,6 +3,9 @@ export interface MessageMention {
     userId: string;
     displayName?: string;
     isAll?: boolean;
+    rawUserId?: string;
+    isSelf?: boolean;
+    nameSource?: "chat" | "account_fallback" | "qce";
 }
 
 /** Never infer a mention or an account from human-readable message text. */
@@ -22,10 +25,16 @@ export function readMessageMentions(value: unknown): MessageMention[] | undefine
         const userId = item.userId.trim();
         if (seen.has(userId)) continue;
         seen.add(userId);
+        const nameSource = item.nameSource === "chat" || item.nameSource === "account_fallback" || item.nameSource === "qce"
+            ? item.nameSource
+            : undefined;
         mentions.push({
             userId,
             ...(typeof item.displayName === "string" ? { displayName: item.displayName } : {}),
             ...(item.isAll === true ? { isAll: true } : {}),
+            ...(typeof item.rawUserId === "string" && item.rawUserId.trim() ? { rawUserId: item.rawUserId.trim() } : {}),
+            ...(item.isSelf === true ? { isSelf: true } : {}),
+            ...(nameSource ? { nameSource } : {}),
         });
     }
     return mentions;

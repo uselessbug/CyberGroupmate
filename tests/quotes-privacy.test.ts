@@ -44,4 +44,59 @@ describe("quote 隐私：派发引用按目标会话 target-aware", () => {
         const r = await resolveQuoteRefs([chatRef], { memory: fakeMemory() });
         assert.equal(r.items[0].content, "");
     });
+
+    it("@person 指定显式 chatId 与派发目标 boundChatId 不一致 → 拒绝解析（不静默替换成目标会话）", async () => {
+        const r = await resolveQuoteRefs(
+            [{ kind: "person", raw: "@person[Alice in telegram:-100other]", query: "Alice", chatId: "telegram:-100other", source: "test" }],
+            { memory: fakeMemory(), boundChatId: "telegram:-100target" },
+        );
+        assert.equal(r.items[0].content, "");
+        assert.ok(r.items[0].warnings.some((w) => w.includes("不一致")));
+    });
+
+    it("被拦截的跨会话私密/历史 @topic quote 不得在 title 或 renderedMarkdown 中泄露外群 topic.label 或 summary", async () => {
+        const privTopic = {
+            id: "tp_priv_secret",
+            chatId: PRIV,
+            label: "绝密私群话题标题_PRIV_LABEL",
+            summary: "绝密私群话题摘要_PRIV_SUMMARY",
+            keywords: ["秘密"],
+            participants: ["u1"],
+            messageRange: { firstMessageId: 1, lastMessageId: 2, count: 2 },
+            startedAt: "2026-01-01T00:00:00.000Z",
+        };
+        const foreignHistTopic = {
+            id: "tp_hist_foreign",
+            chatId: "telegram:-100foreign",
+            historyKey: "hist_topic:foreign",
+            label: "外群历史敏感标题_HIST_LABEL",
+            summary: "外群历史敏感摘要_HIST_SUMMARY",
+            keywords: ["历史"],
+            participants: ["u2"],
+            messageRange: { firstMessageId: 1, lastMessageId: 3, count: 3 },
+            startedAt: "2025-01-01T00:00:00.000Z",
+        };
+        const mem: any = {
+            ...fakeMemory(),
+            getTopicById: (id: string) => (id === privTopic.id ? privTopic : id === foreignHistTopic.id ? foreignHistTopic : null),
+        };
+
+        const rPriv = await resolveQuoteRefs(
+            [{ kind: "topic", raw: `@topic[${privTopic.id}]`, topicId: privTopic.id, source: "test" }],
+            { memory: mem, boundChatId: "telegram:-100dest" },
+        );
+        assert.equal(rPriv.items[0].content, "");
+        assert.equal(rPriv.items[0].title.includes(privTopic.label), false);
+        assert.equal(rPriv.renderedMarkdown?.includes(privTopic.label), false);
+        assert.equal(rPriv.renderedMarkdown?.includes(privTopic.summary), false);
+
+        const rHist = await resolveQuoteRefs(
+            [{ kind: "topic", raw: `@topic[${foreignHistTopic.id}]`, topicId: foreignHistTopic.id, source: "test" }],
+            { memory: mem, boundChatId: "telegram:-100dest" },
+        );
+        assert.equal(rHist.items[0].content, "");
+        assert.equal(rHist.items[0].title.includes(foreignHistTopic.label), false);
+        assert.equal(rHist.renderedMarkdown?.includes(foreignHistTopic.label), false);
+        assert.equal(rHist.renderedMarkdown?.includes(foreignHistTopic.summary), false);
+    });
 });

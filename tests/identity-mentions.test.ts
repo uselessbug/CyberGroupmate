@@ -109,3 +109,146 @@ it("blocks accidental text @ before sending and preserves CQ mentions when addin
         assert.deepEqual(outgoingOneBotMentions([{ type: "text", data: { text: "[CQ:at,qq=222]" } }]), []);
     } finally { nc.dispose(); }
 });
+
+it("grounds platform-resolved mentions into chatNames with strict scope and localOnly boundaries", () => {
+    const scopeLocal = { chatId, localOnly: true };
+    const scopeGlobal = { chatId: "discord:guild1:chan1", localOnly: false };
+
+    // 1. Accepts platform-resolved mention matching target userId
+    const res1 = groundedIdentityUpdate(
+        "onebot:222",
+        { chatNames: ["阿猫"], aliases: ["阿猫"] },
+        [{
+            messageId: "m1",
+            chatId,
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "@阿猫 帮我看下",
+            timestamp: "2026-09-01T00:00:00Z",
+            mentions: [{ userId: "onebot:222", displayName: "阿猫", nameSource: "chat" }],
+        }],
+        [],
+        scopeLocal,
+    );
+    assert.equal(res1.aliases, undefined, "localOnly=true must not mutate global aliases");
+    assert.equal(res1.displayName, undefined);
+    assert.deepEqual(res1.chatNames, [{
+        chatId,
+        messageId: "m1",
+        userId: "onebot:222",
+        kind: "mention_display",
+        displayName: "阿猫",
+        observedAt: "2026-09-01T00:00:00Z",
+    }]);
+
+    // 2. Rejects wrong-target mention, @all, account_fallback, wrong-chat message, blocked message, quoted self-claim, peer teasing
+    const badEvidence = [
+        {
+            messageId: "m_wrong_target",
+            chatId,
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "@阿猫",
+            timestamp: "2026-09-01T00:01:00Z",
+            mentions: [{ userId: "onebot:333", displayName: "阿猫", nameSource: "chat" as const }],
+        },
+        {
+            messageId: "m_all",
+            chatId,
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "@全体成员",
+            timestamp: "2026-09-01T00:02:00Z",
+            mentions: [{ userId: "onebot:222", displayName: "全体成员", isAll: true }],
+        },
+        {
+            messageId: "m_fallback",
+            chatId,
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "@AccountFallback",
+            timestamp: "2026-09-01T00:03:00Z",
+            mentions: [{ userId: "onebot:222", displayName: "AccountFallback", nameSource: "account_fallback" as const }],
+        },
+        {
+            messageId: "m_wrong_chat",
+            chatId: "onebot:group:999",
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "@阿猫",
+            timestamp: "2026-09-01T00:04:00Z",
+            mentions: [{ userId: "onebot:222", displayName: "阿猫", nameSource: "chat" as const }],
+        },
+        {
+            messageId: "m_blocked",
+            chatId,
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "@阿猫",
+            timestamp: "2026-09-01T00:05:00Z",
+            accessControlBlocked: true,
+            mentions: [{ userId: "onebot:222", displayName: "阿猫", nameSource: "chat" as const }],
+        },
+        {
+            messageId: "m_quoted",
+            chatId,
+            userId: "onebot:222",
+            displayName: "222",
+            text: "他说：叫我QuotedName",
+            timestamp: "2026-09-01T00:06:00Z",
+        },
+        {
+            messageId: "m_tease",
+            chatId,
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "大家给222起了外号叫TeaseName",
+            timestamp: "2026-09-01T00:07:00Z",
+        },
+    ];
+    const res2 = groundedIdentityUpdate(
+        "onebot:222",
+        { chatNames: ["阿猫", "全体成员", "AccountFallback", "QuotedName", "TeaseName"], aliases: ["阿猫", "QuotedName", "TeaseName"] },
+        badEvidence,
+        [],
+        scopeLocal,
+    );
+    assert.deepEqual(res2, {});
+
+    // 3. When localOnly=false, own self-claim updates global aliases AND emits chatNames
+    const res3 = groundedIdentityUpdate(
+        "discord:222",
+        { aliases: ["GlobalSelf"], chatNames: ["GlobalSelf"] },
+        [{
+            messageId: "d1",
+            chatId: scopeGlobal.chatId,
+            userId: "discord:222",
+            displayName: "DUser",
+            text: "以后叫我GlobalSelf",
+            timestamp: "2026-09-01T00:08:00Z",
+        }],
+        ["OldAlias"],
+        scopeGlobal,
+    );
+    assert.deepEqual(res3.aliases, ["OldAlias", "GlobalSelf"]);
+    assert.equal(res3.chatNames?.[0]?.kind, "self_claim");
+    assert.equal(res3.chatNames?.[0]?.displayName, "GlobalSelf");
+
+    // 4. Legacy untagged OneBot mention (nameSource undefined) must NOT be grounded as mention_display
+    const res4 = groundedIdentityUpdate(
+        "onebot:222",
+        { chatNames: ["UntaggedLegacy"] },
+        [{
+            messageId: "m_untagged",
+            chatId,
+            userId: "onebot:111",
+            displayName: "Noah",
+            text: "@UntaggedLegacy",
+            timestamp: "2026-09-01T00:09:00Z",
+            mentions: [{ userId: "onebot:222", displayName: "UntaggedLegacy" }],
+        }],
+        [],
+        scopeLocal,
+    );
+    assert.deepEqual(res4, {});
+});

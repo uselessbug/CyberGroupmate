@@ -30,6 +30,55 @@ import {
 import { callLLMWithFallback, type ChatMessage, type LLMConfig as LlmCallConfig } from "../core/llm.js";
 import { loadPromptFile, registerCacheClear } from "../core/prompt-loader.js";
 import { SafeUpdateBuilder, SafeSelectBuilder } from "./query-builder.js";
+import {
+    cleanDisplayName,
+    collectChatNamesFromMessage,
+    deleteSelfClaimChatNamesForMessage,
+    deleteSenderChatNamesForMessage,
+    insertChatNameObservations,
+    normalizeChatNameKey,
+    resolveLatestChatDisplayNames,
+    resolveLatestChatNameRecord,
+    resolveLatestUserChatDisplayNames,
+    searchChatNames as searchChatNamesInDb,
+    type ChatNameHit,
+    type ChatNameObservation,
+    type LatestChatNameRecord,
+} from "./chat-names.js";
+import {
+    HistoryStore,
+    type ChatActivityStats,
+    type EditHistoryFactInput,
+    type EditHistoryFactResult,
+    type HistoryCheckpoint,
+    type HistoryClusterCommitInput,
+    type HistoryClusterCommitResult,
+    type HistoryDashboardFactItem,
+    type HistoryEmbeddingCommitInput,
+    type HistoryFactEvidenceResult,
+    type HistoryFactKind,
+    type HistoryFactReviewAction,
+    type HistoryFactReviewStatus,
+    type HistoryFactSort,
+    type HistoryFinalizeQceImportInput,
+    type HistoryJobKind,
+    type HistoryJobRecord,
+    type HistoryJobStatus,
+    type HistoryLease,
+    type HistoryOverviewChatRecord,
+    type HistorySynthesisCommitInput,
+    type HistorySynthesisCommitResult,
+    type HistorySynthesisProtectionData,
+    type HistoryUnitInput,
+    type HistoryUnitRecord,
+    type HistoryUnitStage,
+    type IngestBatchResult,
+    type IngestMessage,
+    type ListHistoryFactsOptions,
+    type ListHistoryFactsResult,
+    type MemeVariantUsageCounts,
+    type UpsertHistoryJobInput,
+} from "./history-store.js";
 import type {
     IMemoryStoreV2,
     AssociatedMemory,
@@ -106,6 +155,10 @@ function normalizeStoredEmojis(rawEmojis: string | null | undefined, legacyEmoji
 
 function now(): string {
     return new Date().toISOString();
+}
+
+function hashSeedValue(value: unknown): string {
+    return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function buildFtsOrQuery(query: string): string {
@@ -204,6 +257,7 @@ registerCacheClear(() => {
  */
 export class MemoryStoreV2 implements IMemoryStoreV2 {
     private db: Database.Database;
+    private historyStore: HistoryStore;
     private embeddingConfig?: EmbeddingConfig;
     /** sqlite-vec 扩展是否可用 */
     public sqliteVecAvailable = false;
@@ -212,10 +266,12 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         embeddingConfig?: EmbeddingConfig;
     }) {
         this.db = new Database(dbPath);
+        this.db.pragma("busy_timeout = 5000");
         this.db.pragma("journal_mode = WAL");
         this.db.pragma("foreign_keys = ON");
         this.embeddingConfig = options?.embeddingConfig;
         this.initTables();
+        this.historyStore = new HistoryStore(this.db, () => this.sqliteVecAvailable);
         this.sqliteVecAvailable = this.tryLoadSqliteVec();
         if (this.sqliteVecAvailable) {
             this.initVecTables();
@@ -288,48 +344,53 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const dims = this.embeddingConfig?.dimensions ?? 128;
         log.debug("initVecTables", { dims, provider: this.embeddingConfig?.provider ?? "local" });
         try {
-            // 维度变更检测：从 sqlite_master 解析已有 vec0 表的 float[N]，与目标 dims 比对。
-            // ⚠️ 不能靠「CREATE ... IF NOT EXISTS 是否报错」判断——表已存在时它直接 no-op、不校验维度，
-            //    旧维度表会被静默保留，后续按新维度插入才失败。必须显式解析维度。
-            const existingDims = (name: string): number | null => {
-                const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(name) as { sql?: string } | undefined;
-                const m = row?.sql?.match(/float\[(\d+)\]/);
-                return m ? Number(m[1]) : null;
-            };
-            const tDims = existingDims("topics_vec");
-            const fDims = existingDims("facts_vec");
-            const dDims = existingDims("session_digests_vec");
-            const oldDims = tDims ?? fDims ?? dDims;
-            // 仅在 embedding 启用时才因维度不符重建——关闭时不写向量，旧维度表闲置无害，不动它（避免 toggle off 误删向量）。
-            const mismatch = !!this.embeddingConfig
-                && ((tDims != null && tDims !== dims) || (fDims != null && fDims !== dims) || (dDims != null && dDims !== dims));
+            let recreatedForDimChange = false;
+            const runVecInit = this.db.transaction(() => {
+                // 维度变更检测：从 sqlite_master 解析已有 vec0 表的 float[N]，与目标 dims 比对。
+                // ⚠️ 不能靠「CREATE ... IF NOT EXISTS 是否报错」判断——表已存在时它直接 no-op、不校验维度，
+                //    旧维度表会被静默保留，后续按新维度插入才失败。必须显式解析维度。
+                const existingDims = (name: string): number | null => {
+                    const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(name) as { sql?: string } | undefined;
+                    const m = row?.sql?.match(/float\[(\d+)\]/);
+                    return m ? Number(m[1]) : null;
+                };
+                const tDims = existingDims("topics_vec");
+                const fDims = existingDims("facts_vec");
+                const dDims = existingDims("session_digests_vec");
+                const oldDims = tDims ?? fDims ?? dDims;
+                // 仅在 embedding 启用时才因维度不符重建——关闭时不写向量，旧维度表闲置无害，不动它（避免 toggle off 误删向量）。
+                const mismatch = !!this.embeddingConfig
+                    && ((tDims != null && tDims !== dims) || (fDims != null && fDims !== dims) || (dDims != null && dDims !== dims));
+                recreatedForDimChange = mismatch;
 
-            if (mismatch) {
-                // 维度变了：旧 vec 表 + 旧主表向量都按旧维度存的，对新维度不可用。
-                // → DROP 旧 vec 表、清空主表 embedding 列（避免 JS 回退路径用到错维向量报错/出垃圾），按新维度重建。
-                log.warn(
-                    `⚠️ embedding 维度变化：现有 vec0 表为 ${oldDims} 维，配置为 ${dims} 维。` +
-                    `已 DROP 旧 vec 表并清空存量向量，按新维度重建——请运行一次 \`cli memory backfill-embeddings\` 重新生成向量（在此之前向量召回回退为关键词）。`,
-                    { existingTopicDims: tDims, existingFactDims: fDims, targetDims: dims },
-                );
-                this.db.exec(`DROP TABLE IF EXISTS topics_vec`);
-                this.db.exec(`DROP TABLE IF EXISTS facts_vec`);
-                this.db.exec(`DROP TABLE IF EXISTS session_digests_vec`);
-                try { this.db.exec(`UPDATE core_facts SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
-                try { this.db.exec(`UPDATE topics SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
-                try { this.db.exec(`UPDATE session_digests SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
-            }
+                if (mismatch) {
+                    // 维度变了：旧 vec 表 + 旧主表向量都按旧维度存的，对新维度不可用。
+                    // → DROP 旧 vec 表、清空主表 embedding 列（避免 JS 回退路径用到错维向量报错/出垃圾），按新维度重建。
+                    log.warn(
+                        `⚠️ embedding 维度变化：现有 vec0 表为 ${oldDims} 维，配置为 ${dims} 维。` +
+                        `已 DROP 旧 vec 表并清空存量向量，按新维度重建——请运行一次 \`cli memory backfill-embeddings\` 重新生成向量（在此之前向量召回回退为关键词）。`,
+                        { existingTopicDims: tDims, existingFactDims: fDims, targetDims: dims },
+                    );
+                    this.db.exec(`DROP TABLE IF EXISTS topics_vec`);
+                    this.db.exec(`DROP TABLE IF EXISTS facts_vec`);
+                    this.db.exec(`DROP TABLE IF EXISTS session_digests_vec`);
+                    try { this.db.exec(`UPDATE core_facts SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
+                    try { this.db.exec(`UPDATE topics SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
+                    try { this.db.exec(`UPDATE session_digests SET embedding = NULL WHERE embedding IS NOT NULL`); } catch { /* 列可能不存在 */ }
+                }
 
-            this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS topics_vec USING vec0(
-                topic_id TEXT PRIMARY KEY, chat_id TEXT partition key, embedding float[${dims}]
-            )`);
-            this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
-                fact_id TEXT PRIMARY KEY, embedding float[${dims}]
-            )`);
-            this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS session_digests_vec USING vec0(
-                digest_id TEXT PRIMARY KEY, embedding float[${dims}]
-            )`);
-            log.debug("vec0 虚拟表就绪", { dims, recreatedForDimChange: mismatch });
+                this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS topics_vec USING vec0(
+                    topic_id TEXT PRIMARY KEY, chat_id TEXT partition key, embedding float[${dims}]
+                )`);
+                this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(
+                    fact_id TEXT PRIMARY KEY, embedding float[${dims}]
+                )`);
+                this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS session_digests_vec USING vec0(
+                    digest_id TEXT PRIMARY KEY, embedding float[${dims}]
+                )`);
+            });
+            runVecInit.immediate();
+            log.debug("vec0 虚拟表就绪", { dims, recreatedForDimChange });
         } catch (err) {
             log.warn("vec0 虚拟表创建失败", { error: String(err) });
             this.sqliteVecAvailable = false;
@@ -338,7 +399,22 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
     // ─── 建表 ───
 
+    private ensureColumn(table: string, column: string, definition: string): void {
+        const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+        if (!columns.some(col => col.name === column)) {
+            this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        }
+    }
+
     private initTables(): void {
+        const runInit = this.db.transaction(() => {
+            this.initTablesCore();
+            this.runGuardedMigrations();
+        });
+        runInit.immediate();
+    }
+
+    private initTablesCore(): void {
         this.db.exec(`
             -- 话题节点
             CREATE TABLE IF NOT EXISTS topics (
@@ -360,6 +436,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 intervention_count INTEGER DEFAULT 0,
                 associated_memories TEXT DEFAULT '[]',
                 callback_potential INTEGER DEFAULT 0,
+                history_key TEXT,
                 embedding BLOB,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -371,7 +448,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             CREATE TABLE IF NOT EXISTS person_identities (
                 user_id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL DEFAULT '',
+                username TEXT,
                 aliases TEXT NOT NULL DEFAULT '[]',
+                legacy_onebot_names TEXT,
                 total_message_count INTEGER DEFAULT 0,
                 last_seen_at TEXT,
                 first_seen_at TEXT NOT NULL,
@@ -471,6 +550,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 observed_at TEXT,
                 visibility TEXT DEFAULT 'contextual',
                 sensitivity TEXT DEFAULT 'low',
+                history_key TEXT,
+                history_review TEXT,
                 embedding BLOB,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -493,6 +574,10 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 mentions TEXT,
                 access_control_blocked INTEGER NOT NULL DEFAULT 0,
                 access_control_released INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT 'legacy' CHECK (origin IN ('legacy', 'live', 'qce')),
+                qce_meta TEXT,
+                stats_counted INTEGER NOT NULL DEFAULT 0 CHECK (stats_counted IN (0, 1)),
+                stats_hour INTEGER CHECK (stats_hour BETWEEN 0 AND 23),
                 PRIMARY KEY (chat_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS idx_msglog_chat_time ON message_log(chat_id, timestamp);
@@ -560,11 +645,11 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
         // ── 媒体相关表 ──
 
-        // message_log 新增 media 列（兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE message_log ADD COLUMN media_type TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE message_log ADD COLUMN media_info TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE message_log ADD COLUMN access_control_blocked INTEGER NOT NULL DEFAULT 0`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE message_log ADD COLUMN access_control_released INTEGER NOT NULL DEFAULT 0`); } catch { /* 列已存在 */ }
+        // message_log 新增列（兼容旧数据库）
+        this.ensureColumn("message_log", "media_type", "TEXT");
+        this.ensureColumn("message_log", "media_info", "TEXT");
+        this.ensureColumn("message_log", "access_control_blocked", "INTEGER NOT NULL DEFAULT 0");
+        this.ensureColumn("message_log", "access_control_released", "INTEGER NOT NULL DEFAULT 0");
 
         // Sticker 描述缓存表
         this.db.exec(`
@@ -574,15 +659,12 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 created_at TEXT NOT NULL
             );
         `);
-        // 新增 emoji 列（兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE sticker_descriptions ADD COLUMN emoji TEXT`); } catch { /* 列已存在 */ }
-        // 新增 emojis 列：JSON 数组，保留 emoji 列作为旧结构主 emoji
-        try { this.db.exec(`ALTER TABLE sticker_descriptions ADD COLUMN emojis TEXT`); } catch { /* 列已存在 */ }
-        // 新增 enabled 列（默认启用，兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE sticker_descriptions ADD COLUMN enabled INTEGER DEFAULT 1`); } catch { /* 列已存在 */ }
-        // 新增 content_hash 列：内部内容身份，避免 Telegram uniqueFileId 变化导致重复描述
-        try { this.db.exec(`ALTER TABLE sticker_descriptions ADD COLUMN content_hash TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sticker_descriptions_content_hash ON sticker_descriptions(content_hash) WHERE content_hash IS NOT NULL`); } catch { /* index */ }
+        // 新增 emoji / emojis / enabled / content_hash 列（兼容旧数据库）
+        this.ensureColumn("sticker_descriptions", "emoji", "TEXT");
+        this.ensureColumn("sticker_descriptions", "emojis", "TEXT");
+        this.ensureColumn("sticker_descriptions", "enabled", "INTEGER DEFAULT 1");
+        this.ensureColumn("sticker_descriptions", "content_hash", "TEXT");
+        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sticker_descriptions_content_hash ON sticker_descriptions(content_hash) WHERE content_hash IS NOT NULL`);
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS sticker_file_aliases (
                 unique_file_id TEXT PRIMARY KEY,
@@ -590,41 +672,46 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 created_at TEXT NOT NULL
             );
         `);
-        try { this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sticker_file_aliases_content_hash ON sticker_file_aliases(content_hash)`); } catch { /* index */ }
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sticker_file_aliases_content_hash ON sticker_file_aliases(content_hash)`);
 
         // NULL preserves unknown mention provenance for legacy rows.
-        if (!(this.db.prepare("PRAGMA table_info(message_log)").all() as Array<{ name: string }>).some(column => column.name === "mentions")) {
-            this.db.exec("ALTER TABLE message_log ADD COLUMN mentions TEXT");
-        }
+        this.ensureColumn("message_log", "mentions", "TEXT");
+        this.ensureColumn("message_log", "origin", "TEXT NOT NULL DEFAULT 'legacy' CHECK (origin IN ('legacy', 'live', 'qce'))");
+        this.ensureColumn("message_log", "qce_meta", "TEXT");
+        this.ensureColumn("message_log", "stats_counted", "INTEGER NOT NULL DEFAULT 0 CHECK (stats_counted IN (0, 1))");
+        this.ensureColumn("message_log", "stats_hour", "INTEGER CHECK (stats_hour BETWEEN 0 AND 23)");
 
         // person_group_profiles 新增 affinity_score 列（兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE person_group_profiles ADD COLUMN affinity_score REAL DEFAULT 0`); } catch { /* 列已存在 */ }
+        this.ensureColumn("person_group_profiles", "affinity_score", "REAL DEFAULT 0");
 
-        // group_models 新增 is_direct_message 列（兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN is_direct_message INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
+        // group_models 新增列（兼容旧数据库）
+        this.ensureColumn("group_models", "is_direct_message", "INTEGER DEFAULT 0");
+        this.ensureColumn("group_models", "marked_sensitive", "INTEGER DEFAULT 0");
+        this.ensureColumn("group_models", "sensitive_reason", "TEXT");
+        this.ensureColumn("group_models", "sensitive_at", "TEXT");
+        this.ensureColumn("group_models", "quiet_mode", "INTEGER DEFAULT 0");
 
-        // group_models 新增 marked_sensitive / sensitive_reason / sensitive_at 列（全局 visibility 兜底，兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN marked_sensitive INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN sensitive_reason TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN sensitive_at TEXT`); } catch { /* 列已存在 */ }
+        // person_identities 新增列（兼容旧数据库）
+        this.ensureColumn("person_identities", "username", "TEXT");
+        this.ensureColumn("person_identities", "legacy_onebot_names", "TEXT");
 
-        // group_models 新增 quiet_mode 列（静默/mention-only 模式，兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE group_models ADD COLUMN quiet_mode INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
+        // core_facts & topics 新增列（兼容旧数据库）
+        this.ensureColumn("core_facts", "source_chat_id", "TEXT");
+        this.ensureColumn("core_facts", "source_chat_title", "TEXT");
+        this.ensureColumn("core_facts", "source_topic_id", "TEXT");
+        this.ensureColumn("core_facts", "source_topic_label", "TEXT");
+        this.ensureColumn("core_facts", "source_message_ids", "TEXT DEFAULT '[]'");
+        this.ensureColumn("core_facts", "source_interaction_ids", "TEXT DEFAULT '[]'");
+        this.ensureColumn("core_facts", "observed_at", "TEXT");
+        this.ensureColumn("core_facts", "visibility", "TEXT DEFAULT 'contextual'");
+        this.ensureColumn("core_facts", "sensitivity", "TEXT DEFAULT 'low'");
+        this.ensureColumn("core_facts", "history_key", "TEXT");
+        this.ensureColumn("core_facts", "history_review", "TEXT");
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_source_chat ON core_facts(source_chat_id)`);
 
-        // person_identities 新增 username 列（兼容旧数据库）
-        try { this.db.exec(`ALTER TABLE person_identities ADD COLUMN username TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN source_chat_id TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN source_chat_title TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN source_topic_id TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN source_topic_label TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN source_message_ids TEXT DEFAULT '[]'`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN source_interaction_ids TEXT DEFAULT '[]'`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN observed_at TEXT`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN visibility TEXT DEFAULT 'contextual'`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE core_facts ADD COLUMN sensitivity TEXT DEFAULT 'low'`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_source_chat ON core_facts(source_chat_id)`); } catch { /* index */ }
-        try { this.db.exec(`ALTER TABLE topics ADD COLUMN associated_memories TEXT DEFAULT '[]'`); } catch { /* 列已存在 */ }
-        try { this.db.exec(`ALTER TABLE topics ADD COLUMN callback_potential INTEGER DEFAULT 0`); } catch { /* 列已存在 */ }
+        this.ensureColumn("topics", "associated_memories", "TEXT DEFAULT '[]'");
+        this.ensureColumn("topics", "callback_potential", "INTEGER DEFAULT 0");
+        this.ensureColumn("topics", "history_key", "TEXT");
 
         // ── KV Store 表 ──
         this.db.exec(`
@@ -650,23 +737,303 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 PRIMARY KEY (chat_id, key)
             );
             CREATE INDEX IF NOT EXISTS idx_todo_chat_due ON todo_items(chat_id, due_at);
-        `);
 
-        // 回填 person_identities.total_message_count（历史数据从 person_group_profiles 汇总）
-        this.db.exec(`
-            UPDATE person_identities
-            SET total_message_count = COALESCE((
-                SELECT SUM(message_count)
-                FROM person_group_profiles
-                WHERE person_group_profiles.user_id = person_identities.user_id
-            ), 0)
-            WHERE total_message_count = 0
-              AND EXISTS (
-                SELECT 1 FROM person_group_profiles
-                WHERE person_group_profiles.user_id = person_identities.user_id
-                  AND person_group_profiles.message_count > 0
-              )
+            -- 历史迁移、chat 局部人名索引与历史导入基础设施
+            CREATE TABLE IF NOT EXISTS history_migrations (
+                name TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS person_chat_names (
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'sender_display', 'sender_card', 'sender_nickname', 'sender_name',
+                    'mention_display', 'self_claim'
+                )),
+                name_key TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id, user_id, kind, name_key),
+                FOREIGN KEY (chat_id, message_id)
+                    REFERENCES message_log(chat_id, message_id) ON DELETE CASCADE
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_chat_names_lookup
+                ON person_chat_names(chat_id, name_key, user_id, observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_chat_names_user
+                ON person_chat_names(chat_id, user_id, observed_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_message_log_history_time
+                ON message_log(
+                    chat_id,
+                    CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER),
+                    message_id
+                )
+                WHERE access_control_blocked = 0;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_history_topic_key
+                ON topics(chat_id, history_key) WHERE history_key IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_history_fact_key
+                ON core_facts(source_chat_id, history_key) WHERE history_key IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS history_jobs (
+                job_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('qce_import', 'initialize')),
+                chat_id TEXT NOT NULL,
+                input_key TEXT NOT NULL,
+                options_json TEXT NOT NULL,
+                progress_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'paused', 'done')),
+                updated_at TEXT NOT NULL,
+                UNIQUE (kind, chat_id, input_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS history_units (
+                job_id TEXT NOT NULL REFERENCES history_jobs(job_id) ON DELETE CASCADE,
+                stage TEXT NOT NULL CHECK (stage IN ('cluster', 'synthesize', 'embed')),
+                unit_key TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                input_json TEXT NOT NULL,
+                output_json TEXT,
+                completed_at TEXT,
+                PRIMARY KEY (job_id, stage, unit_key),
+                UNIQUE (job_id, stage, ordinal)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS history_cluster_coverage (
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                PRIMARY KEY (chat_id, message_id),
+                FOREIGN KEY (chat_id, message_id)
+                    REFERENCES message_log(chat_id, message_id) ON DELETE CASCADE
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_history_coverage_topic
+                ON history_cluster_coverage(topic_id);
+
+            CREATE TABLE IF NOT EXISTS history_seed_fields (
+                chat_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL CHECK (entity_kind IN ('group', 'member')),
+                entity_id TEXT NOT NULL,
+                field TEXT NOT NULL,
+                rank_key TEXT NOT NULL,
+                value_hash TEXT NOT NULL,
+                PRIMARY KEY (chat_id, entity_kind, entity_id, field)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS history_leases (
+                chat_id TEXT PRIMARY KEY,
+                owner_token TEXT NOT NULL,
+                expires_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS history_fact_rejections (
+                chat_id TEXT NOT NULL,
+                history_key TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                fact_json TEXT NOT NULL,
+                rejected_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, history_key)
+            ) WITHOUT ROWID;
         `);
+    }
+
+    private runGuardedMigrations(): void {
+        const hasMigration = this.db.prepare(
+            "SELECT 1 FROM history_migrations WHERE name = ?"
+        );
+        const markMigration = this.db.prepare(
+            "INSERT OR IGNORE INTO history_migrations (name, completed_at) VALUES (?, ?)"
+        );
+
+        // 1. 回填 person_identities.total_message_count（一次性迁移）
+        if (!hasMigration.get("backfill_total_message_count_v1")) {
+            const runBackfill = this.db.transaction(() => {
+                this.db.exec(`
+                    UPDATE person_identities
+                    SET total_message_count = COALESCE((
+                        SELECT SUM(message_count)
+                        FROM person_group_profiles
+                        WHERE person_group_profiles.user_id = person_identities.user_id
+                    ), 0)
+                    WHERE total_message_count = 0
+                      AND EXISTS (
+                        SELECT 1 FROM person_group_profiles
+                        WHERE person_group_profiles.user_id = person_identities.user_id
+                          AND person_group_profiles.message_count > 0
+                      )
+                `);
+                markMigration.run("backfill_total_message_count_v1", now());
+            });
+            runBackfill();
+        }
+
+        // 2. 一次性投影历史 OneBot 消息名到 person_chat_names 并隔离未核验的全局 OneBot 名称
+        if (!hasMigration.get("onebot_chat_names_backfill_v1")) {
+            const runOneBotMigration = this.db.transaction(() => {
+                const ts = now();
+                const pageStmt = this.db.prepare(`
+                    SELECT chat_id, message_id, user_id, display_name, timestamp, mentions
+                    FROM message_log
+                    WHERE chat_id LIKE 'onebot:%'
+                      AND access_control_blocked = 0
+                      AND (
+                        chat_id > ?
+                        OR (chat_id = ? AND message_id > ?)
+                      )
+                    ORDER BY chat_id ASC, message_id ASC
+                    LIMIT 500
+                `);
+                const insertChatNameStmt = this.db.prepare(`
+                    INSERT OR IGNORE INTO person_chat_names
+                        (chat_id, message_id, user_id, kind, name_key, display_name, observed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `);
+
+                let cursorChat = "";
+                let cursorMsg = "";
+                const pendingLegacyMentions: Array<{
+                    chatId: string;
+                    messageId: string;
+                    userId: string;
+                    nameKey: string;
+                    displayName: string;
+                    observedAt: string;
+                }> = [];
+
+                while (true) {
+                    const rows = pageStmt.all(cursorChat, cursorChat, cursorMsg) as Array<{
+                        chat_id: string;
+                        message_id: string;
+                        user_id: string;
+                        display_name: string;
+                        timestamp: string;
+                        mentions: string | null;
+                    }>;
+                    if (rows.length === 0) break;
+
+                    for (const row of rows) {
+                        cursorChat = row.chat_id;
+                        cursorMsg = row.message_id;
+                        const observedAt = typeof row.timestamp === "string" && row.timestamp.trim()
+                            ? row.timestamp.trim()
+                            : ts;
+                        const senderUid = typeof row.user_id === "string" ? row.user_id.trim() : "";
+                        if (senderUid && senderUid !== "system" && senderUid !== "onebot:all") {
+                            const senderName = cleanDisplayName(row.display_name);
+                            if (senderName) {
+                                const nameKey = normalizeChatNameKey(senderName);
+                                if (nameKey) {
+                                    insertChatNameStmt.run(
+                                        row.chat_id,
+                                        row.message_id,
+                                        senderUid,
+                                        "sender_display",
+                                        nameKey,
+                                        senderName,
+                                        observedAt,
+                                    );
+                                }
+                            }
+                        }
+
+                        const mentions = readMessageMentions(row.mentions);
+                        if (mentions) {
+                            for (const mention of mentions) {
+                                if (!mention.userId || mention.isAll || mention.nameSource === "account_fallback") {
+                                    continue;
+                                }
+                                const mentionName = cleanDisplayName(mention.displayName);
+                                if (!mentionName) continue;
+                                const nameKey = normalizeChatNameKey(mentionName);
+                                if (!nameKey) continue;
+                                if (mention.nameSource === "chat" || mention.nameSource === "qce") {
+                                    insertChatNameStmt.run(
+                                        row.chat_id,
+                                        row.message_id,
+                                        mention.userId,
+                                        "mention_display",
+                                        nameKey,
+                                        mentionName,
+                                        observedAt,
+                                    );
+                                } else {
+                                    // Pre-fix OneBot mentions without nameSource may contain cross-group leaked cards;
+                                    // only index if corroborated by a chat-local sender/self_claim observation in this same chat.
+                                    pendingLegacyMentions.push({
+                                        chatId: row.chat_id,
+                                        messageId: row.message_id,
+                                        userId: mention.userId,
+                                        nameKey,
+                                        displayName: mentionName,
+                                        observedAt,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    if (rows.length < 500) break;
+                }
+
+                if (pendingLegacyMentions.length > 0) {
+                    const checkCorroboratedStmt = this.db.prepare(`
+                        SELECT 1
+                        FROM person_chat_names
+                        WHERE chat_id = ?
+                          AND user_id = ?
+                          AND name_key = ?
+                          AND kind IN ('sender_display', 'sender_card', 'sender_nickname', 'sender_name', 'self_claim')
+                        LIMIT 1
+                    `);
+                    for (const item of pendingLegacyMentions) {
+                        if (checkCorroboratedStmt.get(item.chatId, item.userId, item.nameKey)) {
+                            insertChatNameStmt.run(
+                                item.chatId,
+                                item.messageId,
+                                item.userId,
+                                "mention_display",
+                                item.nameKey,
+                                item.displayName,
+                                item.observedAt,
+                            );
+                        }
+                    }
+                }
+
+                // 隔离已有 OneBot person_identities 行上未分群核验的全局名称与别名
+                const legacyRows = this.db.prepare(`
+                    SELECT user_id, display_name, aliases
+                    FROM person_identities
+                    WHERE user_id LIKE 'onebot:%'
+                      AND (trim(display_name) != '' OR (trim(aliases) != '' AND trim(aliases) != '[]'))
+                `).all() as Array<{ user_id: string; display_name: string; aliases: string }>;
+
+                const quarantineStmt = this.db.prepare(`
+                    UPDATE person_identities
+                    SET legacy_onebot_names = ?,
+                        display_name = '',
+                        aliases = '[]',
+                        updated_at = ?
+                    WHERE user_id = ?
+                `);
+                for (const legacyRow of legacyRows) {
+                    const aliases = fromJSON<string[]>(legacyRow.aliases, []);
+                    const payload = JSON.stringify({
+                        displayName: legacyRow.display_name ?? "",
+                        aliases,
+                        quarantinedAt: ts,
+                    });
+                    quarantineStmt.run(payload, ts, legacyRow.user_id);
+                }
+
+                markMigration.run("onebot_chat_names_backfill_v1", ts);
+            });
+            runOneBotMigration();
+        }
     }
 
     // ─── 写入方法 ───
@@ -988,7 +1355,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
     countRecentMessages(chatId: string, days: number): number {
         const since = new Date(Date.now() - days * 86400_000).toISOString();
         const row = this.db.prepare(
-            "SELECT COUNT(*) as cnt FROM message_log WHERE chat_id = ? AND timestamp >= ?"
+            "SELECT COUNT(*) as cnt FROM message_log WHERE chat_id = ? AND access_control_blocked = 0 AND timestamp >= ?"
         ).get(chatId, since) as { cnt: number } | undefined;
         return row?.cnt ?? 0;
     }
@@ -1002,21 +1369,439 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                  access_control_blocked, access_control_released)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         `);
+        const selectExisting = this.db.prepare(`
+            SELECT user_id, timestamp, origin FROM message_log WHERE chat_id = ? AND message_id = ?
+        `);
+        const promoteQceToLive = this.db.prepare(`
+            UPDATE message_log SET origin = 'live' WHERE chat_id = ? AND message_id = ? AND origin = 'qce'
+        `);
 
         const batch = this.db.transaction((msgs: MessageLogEntry[]) => {
             for (const m of msgs) {
-                insert.run(
+                const res = insert.run(
                     m.messageId, m.chatId, m.userId, m.displayName,
                     m.text, m.replyToMessageId ?? null, m.timestamp,
                     m.mediaType ?? null, m.mediaInfo ?? null,
                     m.mentions === undefined ? null : JSON.stringify(m.mentions),
                     m.accessControlBlocked ? 1 : 0,
                 );
+                if (res.changes === 1) {
+                    if (!m.accessControlBlocked) {
+                        const obs = collectChatNamesFromMessage(m);
+                        if (obs.length > 0) {
+                            insertChatNameObservations(this.db, obs);
+                        }
+                    }
+                } else {
+                    const existing = selectExisting.get(m.chatId, m.messageId) as
+                        | { user_id: string; timestamp: string; origin: string }
+                        | undefined;
+                    if (existing && existing.origin === "qce" && existing.user_id === m.userId) {
+                        const t1 = Date.parse(existing.timestamp);
+                        const t2 = Date.parse(m.timestamp);
+                        const tsMatches = existing.timestamp === m.timestamp
+                            || (Number.isFinite(t1) && Number.isFinite(t2) && Math.abs(t1 - t2) <= 1000);
+                        if (tsMatches) {
+                            promoteQceToLive.run(m.chatId, m.messageId);
+                        }
+                    }
+                }
             }
         });
 
         batch(messages);
         log.debug("storeMessageBatch", { count: messages.length });
+    }
+
+    storeIngestedBatch(entries: IngestMessage[], checkpoint?: HistoryCheckpoint): IngestBatchResult {
+        return this.historyStore.storeIngestedBatch(entries, checkpoint);
+    }
+
+    acquireHistoryLease(chatId: string, ttlMs?: number): HistoryLease {
+        return this.historyStore.acquireHistoryLease(chatId, ttlMs);
+    }
+
+    renewHistoryLease(chatId: string, ownerToken: string, ttlMs?: number): number {
+        return this.historyStore.renewHistoryLease(chatId, ownerToken, ttlMs);
+    }
+
+    releaseHistoryLease(chatId: string, ownerToken: string): void {
+        this.historyStore.releaseHistoryLease(chatId, ownerToken);
+    }
+
+    getHistoryJob(kind: HistoryJobKind, chatId: string, inputKey: string): HistoryJobRecord | null {
+        return this.historyStore.getHistoryJob(kind, chatId, inputKey);
+    }
+
+    findLatestHistoryJob(kind: HistoryJobKind, chatId: string): HistoryJobRecord | null {
+        return this.historyStore.findLatestHistoryJob(kind, chatId);
+    }
+
+    upsertHistoryJob(job: UpsertHistoryJobInput, ownerToken?: string): HistoryJobRecord {
+        return this.historyStore.upsertHistoryJob(job, ownerToken);
+    }
+
+    updateHistoryJobStatus(
+        jobId: string,
+        ownerToken: string,
+        status: HistoryJobStatus,
+        progress?: Record<string, unknown> | string,
+    ): HistoryJobRecord {
+        return this.historyStore.updateHistoryJobStatus(jobId, ownerToken, status, progress);
+    }
+
+    recomputeChatActivityStats(chatId: string, timezone?: string): ChatActivityStats {
+        return this.historyStore.recomputeChatActivityStats(chatId, timezone);
+    }
+
+    finalizeQceImport(input: HistoryFinalizeQceImportInput): ChatActivityStats | null {
+        return this.historyStore.finalizeQceImport(input);
+    }
+
+    upsertHistoryUnits(jobId: string, stage: HistoryUnitStage, units: HistoryUnitInput[], ownerToken: string): void {
+        this.historyStore.upsertHistoryUnits(jobId, stage, units, ownerToken);
+    }
+
+    listHistoryUnits(jobId: string, stage: HistoryUnitStage): HistoryUnitRecord[] {
+        return this.historyStore.listHistoryUnits(jobId, stage);
+    }
+
+    markHistoryUnitCompleted(
+        jobId: string,
+        ownerToken: string,
+        stage: HistoryUnitStage,
+        unitKey: string,
+        outputJson: string,
+    ): HistoryUnitRecord {
+        return this.historyStore.markHistoryUnitCompleted(jobId, ownerToken, stage, unitKey, outputJson);
+    }
+
+    getCoveredMessageIds(chatId: string): Set<string> {
+        return this.historyStore.getCoveredMessageIds(chatId);
+    }
+
+    countChatMemeVariantUsage(chatId: string, variants: readonly string[]): MemeVariantUsageCounts {
+        return this.historyStore.countChatMemeVariantUsage(chatId, variants);
+    }
+
+    getHistoricalTopicsForChat(chatId: string): TopicNode[] {
+        return this.historyStore.getHistoricalTopicsForChat(chatId);
+    }
+
+    getUnembeddedHistoryTargets(
+        chatId: string,
+        options?: { sinceMs?: number; untilMs?: number; topicIds?: string[] },
+    ): {
+        topics: Array<{ id: string; text: string }>;
+        facts: Array<{ id: string; text: string }>;
+    } {
+        const topicConds = [
+            "chat_id = ?",
+            "history_key IS NOT NULL",
+            "embedding IS NULL",
+            "(label != '' OR summary != '')",
+        ];
+        const topicParams: unknown[] = [chatId];
+        if (options?.sinceMs !== undefined) {
+            topicConds.push("CAST(ROUND(unixepoch(started_at, 'subsec') * 1000) AS INTEGER) >= ?");
+            topicParams.push(options.sinceMs);
+        }
+        if (options?.untilMs !== undefined) {
+            topicConds.push("CAST(ROUND(unixepoch(COALESCE(ended_at, started_at), 'subsec') * 1000) AS INTEGER) < ?");
+            topicParams.push(options.untilMs);
+        }
+        if (options?.topicIds !== undefined) {
+            if (options.topicIds.length === 0) {
+                return { topics: [], facts: [] };
+            }
+            const placeholders = options.topicIds.map(() => "?").join(", ");
+            topicConds.push(`id IN (${placeholders})`);
+            topicParams.push(...options.topicIds);
+        }
+
+        const topicRows = this.db.prepare(`
+            SELECT id, label, summary
+            FROM topics
+            WHERE ${topicConds.join(" AND ")}
+            ORDER BY started_at ASC, id ASC
+        `).all(...topicParams) as Array<{ id: string; label: string; summary: string }>;
+
+        const factConds = [
+            "source_chat_id = ?",
+            "history_key IS NOT NULL",
+            "embedding IS NULL",
+            "(expires_at IS NULL OR expires_at > datetime('now'))",
+        ];
+        const factParams: unknown[] = [chatId];
+        if (options?.sinceMs !== undefined) {
+            factConds.push("observed_at IS NOT NULL AND CAST(ROUND(unixepoch(observed_at, 'subsec') * 1000) AS INTEGER) >= ?");
+            factParams.push(options.sinceMs);
+        }
+        if (options?.untilMs !== undefined) {
+            factConds.push("observed_at IS NOT NULL AND CAST(ROUND(unixepoch(observed_at, 'subsec') * 1000) AS INTEGER) < ?");
+            factParams.push(options.untilMs);
+        }
+        if (options?.topicIds !== undefined && options.topicIds.length > 0) {
+            const placeholders = options.topicIds.map(() => "?").join(", ");
+            factConds.push(`source_topic_id IN (${placeholders})`);
+            factParams.push(...options.topicIds);
+        }
+
+        const factRows = this.db.prepare(`
+            SELECT id, subject, content
+            FROM core_facts
+            WHERE ${factConds.join(" AND ")}
+            ORDER BY observed_at ASC, id ASC
+        `).all(...factParams) as Array<{ id: string; subject: string; content: string }>;
+
+        return {
+            topics: topicRows.map(r => ({ id: r.id, text: `${r.label} ${r.summary}`.trim() })),
+            facts: factRows.map(r => ({ id: r.id, text: `${r.subject}: ${r.content}`.trim() })),
+        };
+    }
+
+    commitHistoricalClusterUnit(input: HistoryClusterCommitInput): HistoryClusterCommitResult {
+        return this.historyStore.commitHistoricalClusterUnit(input);
+    }
+
+    commitHistoricalSynthesisUnit(input: HistorySynthesisCommitInput): HistorySynthesisCommitResult {
+        return this.historyStore.commitHistoricalSynthesisUnit(input);
+    }
+
+    commitHistoricalEmbeddingUnit(input: HistoryEmbeddingCommitInput): void {
+        this.historyStore.commitHistoricalEmbeddingUnit(input);
+    }
+
+    getHistoryLease(chatId: string): HistoryLease | null {
+        return this.historyStore.getHistoryLease(chatId);
+    }
+
+    listCompletedHistoryUnitKeys(
+        chatId: string,
+        kind: HistoryJobKind,
+        stage: HistoryUnitStage,
+    ): Set<string> {
+        return this.historyStore.listCompletedHistoryUnitKeys(chatId, kind, stage);
+    }
+
+    getSynthesisProtectionData(chatId: string): HistorySynthesisProtectionData {
+        return this.historyStore.getSynthesisProtectionData(chatId);
+    }
+
+    listHistoryFacts(options: ListHistoryFactsOptions): ListHistoryFactsResult {
+        return this.historyStore.listHistoryFacts(options);
+    }
+
+    reviewHistoryFacts(
+        chatId: string,
+        action: HistoryFactReviewAction,
+        historyKeys: readonly string[],
+    ): number {
+        return this.historyStore.reviewHistoryFacts(chatId, action, historyKeys);
+    }
+
+    editHistoryFact(input: EditHistoryFactInput): EditHistoryFactResult {
+        return this.historyStore.editHistoryFact(input);
+    }
+
+    getHistoryFactEvidence(chatId: string, historyKey: string): HistoryFactEvidenceResult | null {
+        return this.historyStore.getHistoryFactEvidence(chatId, historyKey);
+    }
+
+    getHistoryOverviewChats(activeRunnerChatId: string | null): HistoryOverviewChatRecord[] {
+        return this.historyStore.getHistoryOverviewChats(activeRunnerChatId);
+    }
+
+    /** 按确定性时间序分页读取 message_log 中的可聚类历史消息（供离线窗口切分使用） */
+    listEligibleHistoryMessagePage(
+        chatId: string,
+        cursor: { timestampMs: number; messageId: string } | null,
+        limit: number = 500,
+        bounds?: { sinceMs?: number; untilMs?: number },
+    ): Array<{
+        messageId: string;
+        chatId: string;
+        userId: string;
+        displayName: string;
+        text: string;
+        replyToMessageId: string | null;
+        timestamp: string;
+        timestampMs: number;
+        mentions: string | null;
+        mediaType: string | null;
+        mediaInfo: string | null;
+        qceMeta: string | null;
+    }> {
+        const boundedLimit = Math.max(1, Math.min(2000, Math.floor(limit)));
+        const baseCols = `
+            SELECT
+                message_id,
+                chat_id,
+                user_id,
+                display_name,
+                text,
+                reply_to_message_id,
+                timestamp,
+                CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER) AS timestamp_ms,
+                mentions,
+                media_type,
+                media_info,
+                qce_meta
+            FROM message_log
+        `;
+        const tsExpr = "CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER)";
+        const conditions: string[] = [
+            "chat_id = ?",
+            "access_control_blocked = 0",
+        ];
+        const params: unknown[] = [chatId];
+
+        if (bounds?.sinceMs !== undefined) {
+            conditions.push(`${tsExpr} >= ?`);
+            params.push(bounds.sinceMs);
+        }
+        if (bounds?.untilMs !== undefined) {
+            conditions.push(`${tsExpr} < ?`);
+            params.push(bounds.untilMs);
+        }
+        if (cursor !== null) {
+            conditions.push(`${tsExpr} >= ?`);
+            conditions.push(`(${tsExpr} > ? OR (${tsExpr} = ? AND message_id COLLATE BINARY > ?))`);
+            params.push(cursor.timestampMs, cursor.timestampMs, cursor.timestampMs, cursor.messageId);
+        }
+        params.push(boundedLimit);
+
+        const rows = this.db.prepare(`
+            ${baseCols}
+            WHERE ${conditions.join("\n              AND ")}
+            ORDER BY
+                ${tsExpr} ASC,
+                message_id COLLATE BINARY ASC
+            LIMIT ?
+        `).all(...params) as Array<Record<string, unknown>>;
+
+        return rows.map(row => ({
+            messageId: row.message_id as string,
+            chatId: row.chat_id as string,
+            userId: row.user_id as string,
+            displayName: (row.display_name as string) ?? "",
+            text: (row.text as string) ?? "",
+            replyToMessageId: (row.reply_to_message_id as string) ?? null,
+            timestamp: row.timestamp as string,
+            timestampMs: Number(row.timestamp_ms ?? 0),
+            mentions: (row.mentions as string) ?? null,
+            mediaType: (row.media_type as string) ?? null,
+            mediaInfo: (row.media_info as string) ?? null,
+            qceMeta: (row.qce_meta as string) ?? null,
+        }));
+    }
+
+    /** 批量按 messageId 获取未受访问控制拦截的完整历史消息行 */
+    getEligibleHistoryMessagesByIds(
+        chatId: string,
+        messageIds: readonly string[],
+    ): Array<{
+        messageId: string;
+        chatId: string;
+        userId: string;
+        displayName: string;
+        text: string;
+        replyToMessageId: string | null;
+        timestamp: string;
+        timestampMs: number;
+        mentions: string | null;
+        mediaType: string | null;
+        mediaInfo: string | null;
+        qceMeta: string | null;
+    }> {
+        const uniqueIds = [...new Set(messageIds.map(id => String(id).trim()).filter(Boolean))];
+        if (uniqueIds.length === 0) return [];
+
+        const CHUNK = 200;
+        const byId = new Map<string, {
+            messageId: string;
+            chatId: string;
+            userId: string;
+            displayName: string;
+            text: string;
+            replyToMessageId: string | null;
+            timestamp: string;
+            timestampMs: number;
+            mentions: string | null;
+            mediaType: string | null;
+            mediaInfo: string | null;
+            qceMeta: string | null;
+        }>();
+
+        for (let i = 0; i < uniqueIds.length; i += CHUNK) {
+            const chunk = uniqueIds.slice(i, i + CHUNK);
+            const placeholders = chunk.map(() => "?").join(", ");
+            const rows = this.db.prepare(`
+                SELECT
+                    message_id,
+                    chat_id,
+                    user_id,
+                    display_name,
+                    text,
+                    reply_to_message_id,
+                    timestamp,
+                    CAST(ROUND(unixepoch(timestamp, 'subsec') * 1000) AS INTEGER) AS timestamp_ms,
+                    mentions,
+                    media_type,
+                    media_info,
+                    qce_meta
+                FROM message_log
+                WHERE chat_id = ?
+                  AND access_control_blocked = 0
+                  AND message_id IN (${placeholders})
+            `).all(chatId, ...chunk) as Array<Record<string, unknown>>;
+
+            for (const row of rows) {
+                const entry = {
+                    messageId: row.message_id as string,
+                    chatId: row.chat_id as string,
+                    userId: row.user_id as string,
+                    displayName: (row.display_name as string) ?? "",
+                    text: (row.text as string) ?? "",
+                    replyToMessageId: (row.reply_to_message_id as string) ?? null,
+                    timestamp: row.timestamp as string,
+                    timestampMs: Number(row.timestamp_ms ?? 0),
+                    mentions: (row.mentions as string) ?? null,
+                    mediaType: (row.media_type as string) ?? null,
+                    mediaInfo: (row.media_info as string) ?? null,
+                    qceMeta: (row.qce_meta as string) ?? null,
+                };
+                byId.set(entry.messageId, entry);
+            }
+        }
+
+        const out = [];
+        for (const id of messageIds) {
+            const hit = byId.get(id);
+            if (hit) out.push(hit);
+        }
+        return out;
+    }
+
+    insertChatNameObservations(observations: ChatNameObservation[]): number {
+        return insertChatNameObservations(this.db, observations);
+    }
+
+    searchChatNames(chatId: string, query: string, limit: number = 20): ChatNameHit[] {
+        return searchChatNamesInDb(this.db, chatId, query, limit);
+    }
+
+    getChatDisplayName(chatId: string, userId: string): string | null {
+        if (!chatId || !userId) return null;
+        return resolveLatestChatDisplayNames(this.db, chatId, [userId]).get(userId) ?? null;
+    }
+
+    getChatDisplayNames(chatId: string, userIds?: string[]): Map<string, string> {
+        return resolveLatestChatDisplayNames(this.db, chatId, userIds);
+    }
+
+    getLatestChatNameForUser(chatId: string, userId: string): LatestChatNameRecord | null {
+        return resolveLatestChatNameRecord(this.db, chatId, userId);
     }
 
     /** 写入核心事实到 core_facts 表 */
@@ -1216,6 +2001,33 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         }
     }
 
+    commitMergedEpisodes(
+        userId: string,
+        chatId: string,
+        input: { removedLiveEpisodeIds: string[]; mergedMemory: MergedMemory[] },
+    ): void {
+        const run = this.db.transaction(() => {
+            const row = this.db.prepare(
+                "SELECT recent_episodes FROM person_group_profiles WHERE user_id = ? AND chat_id = ?"
+            ).get(userId, chatId) as { recent_episodes?: string } | undefined;
+            if (!row) return;
+
+            const currentEpisodes = fromJSON<InteractionEpisode[]>(row.recent_episodes, []);
+            const removedIds = new Set(input.removedLiveEpisodeIds);
+            const nextEpisodes = currentEpisodes.filter(
+                ep => ep.origin === "offline_history" || !removedIds.has(ep.id),
+            );
+            this.db.prepare(`
+                UPDATE person_group_profiles
+                SET recent_episodes = ?,
+                    merged_memory = ?,
+                    updated_at = ?
+                WHERE user_id = ? AND chat_id = ?
+            `).run(toJSON(nextEpisodes), toJSON(input.mergedMemory), now(), userId, chatId);
+        });
+        run();
+    }
+
     incrementProfileStats(userId: string, chatId: string, stats: {
         messageCountDelta: number;
         activeHoursDelta: number[];
@@ -1386,6 +2198,95 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         };
     }
 
+    getGroupCultureModel(chatId: string): GroupModel | null {
+        if (!chatId || typeof chatId !== "string") {
+            return null;
+        }
+        const guildKey = safeGroupModelKey(chatId);
+        const base = this.getGroupModel(guildKey);
+        if (guildKey === chatId) {
+            return base;
+        }
+        const exact = this.getGroupModel(chatId);
+        if (!exact && !base) return null;
+
+        const hasExactCulture = Boolean(
+            exact && (
+                exact.description.trim()
+                || exact.communicationNorms.length > 0
+                || exact.hotTopics.length > 0
+                || exact.tabooTopics.length > 0
+                || exact.agentRole.trim()
+            ),
+        );
+        const hasExactLangSeed = Boolean(
+            exact && this.db.prepare(
+                "SELECT 1 FROM history_seed_fields WHERE chat_id = ? AND entity_kind = 'group' AND entity_id = ? AND field = 'dominantLanguage' LIMIT 1"
+            ).get(chatId, chatId),
+        );
+
+        return {
+            chatId,
+            chatTitle: exact?.chatTitle || base?.chatTitle || "",
+            isDirectMessage: exact?.isDirectMessage ?? false,
+            markedSensitive: Boolean(exact?.markedSensitive || base?.markedSensitive),
+            sensitiveReason: exact?.sensitiveReason ?? base?.sensitiveReason,
+            sensitiveAt: exact?.sensitiveAt ?? base?.sensitiveAt ?? null,
+            quietMode: Boolean(exact?.quietMode || base?.quietMode),
+            description: exact?.description || base?.description || "",
+            dominantLanguage: (exact && (hasExactLangSeed || (exact.dominantLanguage && exact.dominantLanguage !== "zh")))
+                ? exact.dominantLanguage
+                : (base?.dominantLanguage ?? "zh"),
+            communicationNorms: exact?.communicationNorms.length ? exact.communicationNorms : (base?.communicationNorms ?? []),
+            activeMembers: exact?.activeMembers ?? 0,
+            avgMessagesPerDay: exact?.avgMessagesPerDay ?? 0,
+            peakHours: exact?.peakHours ?? [],
+            agentRole: exact?.agentRole || base?.agentRole || "",
+            engagementLevel: hasExactCulture ? exact!.engagementLevel : (base?.engagementLevel ?? "medium"),
+            recentFeedback: exact?.recentFeedback ?? "",
+            hotTopics: exact?.hotTopics.length ? exact.hotTopics : (base?.hotTopics ?? []),
+            tabooTopics: exact?.tabooTopics.length ? exact.tabooTopics : (base?.tabooTopics ?? []),
+            lastReflectedAt: exact?.lastReflectedAt ?? null,
+            updatedAt: exact?.updatedAt ?? base?.updatedAt ?? "",
+        };
+    }
+
+    isHistoricalFact(id: string): boolean {
+        if (!id || typeof id !== "string") return false;
+        const row = this.db.prepare(
+            "SELECT 1 FROM core_facts WHERE id = ? AND history_key IS NOT NULL LIMIT 1"
+        ).get(id);
+        return Boolean(row);
+    }
+
+    getFactById(id: string): CoreFact | null {
+        if (!id || typeof id !== "string") return null;
+        const row = this.db.prepare("SELECT * FROM core_facts WHERE id = ? LIMIT 1").get(id) as Record<string, unknown> | undefined;
+        if (!row) return null;
+        return {
+            id: row.id as string,
+            subject: row.subject as string,
+            content: row.content as string,
+            category: row.category as FactCategory,
+            confidence: row.confidence as number,
+            source: (row.source as string) ?? null,
+            sourceChatId: (row.source_chat_id as string) ?? null,
+            sourceChatTitle: (row.source_chat_title as string) ?? null,
+            sourceTopicId: (row.source_topic_id as string) ?? null,
+            sourceTopicLabel: (row.source_topic_label as string) ?? null,
+            sourceMessageIds: fromJSON<string[]>(row.source_message_ids as string, []),
+            sourceInteractionIds: fromJSON<string[]>(row.source_interaction_ids as string, []),
+            observedAt: (row.observed_at as string) ?? null,
+            visibility: ((row.visibility as string) ?? "contextual") as CoreFact["visibility"],
+            sensitivity: ((row.sensitivity as string) ?? "low") as CoreFact["sensitivity"],
+            historyKey: (row.history_key as string) ?? null,
+            historyReview: (row.history_review as "approved" | null) ?? null,
+            createdAt: row.created_at as string,
+            updatedAt: row.updated_at as string,
+            expiresAt: (row.expires_at as string) ?? null,
+        };
+    }
+
     /**
      * 将某会话标记为敏感/私密（append-only：只置 true、幂等、无取消路径）。
      * 写到规范化的 GroupModel key（Discord channel→guild），使全体 GroupModel 读者（reflection /
@@ -1518,9 +2419,20 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         queryEmbedding: Float32Array,
         limit: number = 10,
         chatId?: string,
+        options?: { authorizedChatId?: string; includeAllHistory?: boolean },
     ): Array<TopicNode & { similarity: number }> {
+        const includeAllHistory = options?.includeAllHistory === true;
+        const hasExplicitAuth = Boolean(options && Object.prototype.hasOwnProperty.call(options, "authorizedChatId"));
+        const authChatId = hasExplicitAuth ? options?.authorizedChatId : chatId;
+        const needsSqlHistoryFilter = !includeAllHistory && (!chatId || authChatId !== chatId);
+        const hasHistoricalTopics = needsSqlHistoryFilter && Boolean(
+            chatId
+                ? this.db.prepare("SELECT 1 FROM topics WHERE chat_id = ? AND history_key IS NOT NULL LIMIT 1").get(chatId)
+                : this.db.prepare("SELECT 1 FROM topics WHERE history_key IS NOT NULL LIMIT 1").get()
+        );
+
         // ── vec0 快路径 ──
-        if (this.sqliteVecAvailable) {
+        if (this.sqliteVecAvailable && !hasHistoricalTopics) {
             try {
                 let sql: string;
                 const params: unknown[] = [embeddingToBuffer(queryEmbedding), limit];
@@ -1565,8 +2477,21 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const selectBuilder = new SafeSelectBuilder("topics")
             .from("SELECT * FROM topics")
             .where("embedding IS NOT NULL");
-        if (chatId) selectBuilder.whereEq("chat_id", chatId);
-        const { sql, params } = selectBuilder.build();
+        if (chatId) {
+            selectBuilder.whereEq("chat_id", chatId);
+        }
+        if (!includeAllHistory) {
+            if (authChatId) {
+                selectBuilder.where("(history_key IS NULL OR chat_id = ?)");
+            } else {
+                selectBuilder.where("history_key IS NULL");
+            }
+        }
+        const built = selectBuilder.build();
+        const sql = built.sql;
+        const params = (!includeAllHistory && authChatId)
+            ? [...built.params, authChatId]
+            : built.params;
 
         const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
         log.debug("vectorSearchTopics[JS]: 候选数", { count: rows.length, chatId });
@@ -1600,10 +2525,19 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         queryEmbedding: Float32Array,
         limit: number = 10,
         categories?: FactCategory[],
+        options?: { chatId?: string; authorizedChatId?: string; includeAllHistory?: boolean },
     ): Array<{ id: string; content: string; category: FactCategory; subject: string; confidence: number; similarity: number; visibility?: "private" | "contextual" | "public"; sourceChatId?: string | null }> {
+        const chatIdFilter = options?.chatId;
+        const includeAllHistory = options?.includeAllHistory === true;
+        const hasExplicitAuth = Boolean(options && Object.prototype.hasOwnProperty.call(options, "authorizedChatId"));
+        const authChatId = hasExplicitAuth ? options?.authorizedChatId : chatIdFilter;
+        const hasHistoricalFacts = !includeAllHistory && Boolean(
+            this.db.prepare("SELECT 1 FROM core_facts WHERE history_key IS NOT NULL LIMIT 1").get()
+        );
+
         // ── vec0 快路径 ──
-        if (this.sqliteVecAvailable && !categories?.length) {
-            // vec0 不支持 category 过滤（非 partition key），仅在无 category 过滤时使用
+        if (this.sqliteVecAvailable && !categories?.length && !chatIdFilter && !hasHistoricalFacts) {
+            // vec0 不支持 category/source_chat_id 过滤（非 partition key）
             try {
                 const sql = `SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance`;
                 const vecRows = this.db.prepare(sql).all(
@@ -1645,14 +2579,28 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         }
 
         // ── 纯 JS fallback ──
-        const selectBuilder = new SafeSelectBuilder("core_facts")
-            .from("SELECT * FROM core_facts")
-            .where("embedding IS NOT NULL")
-            .where("(expires_at IS NULL OR expires_at > datetime('now'))");
+        const conditions = [
+            "embedding IS NOT NULL",
+            "(expires_at IS NULL OR expires_at > datetime('now'))",
+        ];
+        const params: unknown[] = [];
         if (categories?.length) {
-            selectBuilder.whereIn("category", categories);
+            conditions.push(`category IN (${categories.map(() => "?").join(", ")})`);
+            params.push(...categories);
         }
-        const { sql, params } = selectBuilder.build();
+        if (chatIdFilter) {
+            conditions.push("source_chat_id = ?");
+            params.push(chatIdFilter);
+        }
+        if (!includeAllHistory) {
+            if (authChatId) {
+                conditions.push("(history_key IS NULL OR source_chat_id = ?)");
+                params.push(authChatId);
+            } else {
+                conditions.push("history_key IS NULL");
+            }
+        }
+        const sql = `SELECT * FROM core_facts WHERE ${conditions.join(" AND ")}`;
 
         const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
         log.debug("vectorSearchFacts[JS]: 候选数", { count: rows.length });
@@ -1799,6 +2747,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const entries: TimelineEntry[] = [];
         const includeDigests = options.includeDigests !== false;
         const includeTopics = options.includeTopics !== false;
+        const includeAllHistory = options.includeAllHistory === true;
+        const hasExplicitAuth = Object.prototype.hasOwnProperty.call(options, "authorizedChatId");
+        const authorizedChatId = hasExplicitAuth ? options.authorizedChatId : options.chatId;
 
         if (includeDigests) {
             for (const digest of this.listSessionDigests({
@@ -1831,6 +2782,14 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             if (options.chatId) {
                 conditions.push("chat_id = ?");
                 params.push(options.chatId);
+            }
+            if (!includeAllHistory) {
+                if (authorizedChatId) {
+                    conditions.push("(history_key IS NULL OR chat_id = ?)");
+                    params.push(authorizedChatId);
+                } else {
+                    conditions.push("history_key IS NULL");
+                }
             }
             if (options.after) {
                 conditions.push("started_at >= ?");
@@ -1902,6 +2861,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const maxResults = options?.maxResults ?? 10;
         const chatIdFilter = options?.chatId;
         const daysBack = options?.daysBack;
+        const includeAllHistory = options?.includeAllHistory === true;
+        const hasExplicitAuth = Boolean(options && Object.prototype.hasOwnProperty.call(options, "authorizedChatId"));
+        const authorizedChatId = hasExplicitAuth ? options?.authorizedChatId : chatIdFilter;
 
         // ─── 路径 1：向量搜索（主路径，如有 embeddingConfig） ───
         if (this.embeddingConfig) {
@@ -1909,13 +2871,20 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 const [queryVec] = await embed([query], this.embeddingConfig);
                 if (queryVec) {
                     // 向量搜索 topics
-                    const vecTopics = this.vectorSearchTopics(queryVec, maxResults, chatIdFilter);
+                    const vecTopics = this.vectorSearchTopics(queryVec, maxResults, chatIdFilter, {
+                        authorizedChatId,
+                        includeAllHistory,
+                    });
                     for (const t of vecTopics) {
                         if (!topicMap.has(t.id)) topicMap.set(t.id, t);
                     }
 
                     // 向量搜索 facts
-                    const vecFacts = this.vectorSearchFacts(queryVec, maxResults, options?.categories);
+                    const vecFacts = this.vectorSearchFacts(queryVec, maxResults, options?.categories, {
+                        chatId: chatIdFilter,
+                        authorizedChatId,
+                        includeAllHistory,
+                    });
                     for (const f of vecFacts) {
                         if (!factMap.has(f.id)) factMap.set(f.id, {
                             content: f.content, category: f.category,
@@ -1939,7 +2908,18 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 WHERE topics_fts MATCH ?
             `;
             const params: unknown[] = [query];
-            if (chatIdFilter) { topicQuery += " AND t.chat_id = ?"; params.push(chatIdFilter); }
+            if (chatIdFilter) {
+                topicQuery += " AND t.chat_id = ?";
+                params.push(chatIdFilter);
+            }
+            if (!includeAllHistory) {
+                if (authorizedChatId) {
+                    topicQuery += " AND (t.history_key IS NULL OR t.chat_id = ?)";
+                    params.push(authorizedChatId);
+                } else {
+                    topicQuery += " AND t.history_key IS NULL";
+                }
+            }
             if (daysBack) {
                 topicQuery += " AND t.started_at >= ?";
                 params.push(new Date(Date.now() - daysBack * 86400000).toISOString());
@@ -1962,7 +2942,18 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 let likeQuery = "SELECT * FROM topics WHERE (label LIKE ? OR summary LIKE ? OR keywords LIKE ?)";
                 const likePattern = `%${query}%`;
                 const params: unknown[] = [likePattern, likePattern, likePattern];
-                if (chatIdFilter) { likeQuery += " AND chat_id = ?"; params.push(chatIdFilter); }
+                if (chatIdFilter) {
+                    likeQuery += " AND chat_id = ?";
+                    params.push(chatIdFilter);
+                }
+                if (!includeAllHistory) {
+                    if (authorizedChatId) {
+                        likeQuery += " AND (history_key IS NULL OR chat_id = ?)";
+                        params.push(authorizedChatId);
+                    } else {
+                        likeQuery += " AND history_key IS NULL";
+                    }
+                }
                 if (daysBack) {
                     likeQuery += " AND started_at >= ?";
                     params.push(new Date(Date.now() - daysBack * 86400000).toISOString());
@@ -1987,6 +2978,18 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 AND (cf.expires_at IS NULL OR cf.expires_at > datetime('now'))
             `;
             const params: unknown[] = [query];
+            if (chatIdFilter) {
+                factQuery += " AND cf.source_chat_id = ?";
+                params.push(chatIdFilter);
+            }
+            if (!includeAllHistory) {
+                if (authorizedChatId) {
+                    factQuery += " AND (cf.history_key IS NULL OR cf.source_chat_id = ?)";
+                    params.push(authorizedChatId);
+                } else {
+                    factQuery += " AND cf.history_key IS NULL";
+                }
+            }
             if (options?.categories?.length) {
                 factQuery += ` AND cf.category IN (${options.categories.map(() => "?").join(", ")})`;
                 params.push(...options.categories);
@@ -2016,6 +3019,18 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 const likePattern = `%${query}%`;
                 let likeQuery = "SELECT * FROM core_facts WHERE (content LIKE ? OR subject LIKE ?) AND (expires_at IS NULL OR expires_at > datetime('now'))";
                 const params: unknown[] = [likePattern, likePattern];
+                if (chatIdFilter) {
+                    likeQuery += " AND source_chat_id = ?";
+                    params.push(chatIdFilter);
+                }
+                if (!includeAllHistory) {
+                    if (authorizedChatId) {
+                        likeQuery += " AND (history_key IS NULL OR source_chat_id = ?)";
+                        params.push(authorizedChatId);
+                    } else {
+                        likeQuery += " AND history_key IS NULL";
+                    }
+                }
                 if (options?.categories?.length) {
                     likeQuery += ` AND category IN (${options.categories.map(() => "?").join(", ")})`;
                     params.push(...options.categories);
@@ -2046,8 +3061,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             after: daysBack ? new Date(Date.now() - daysBack * 86400000).toISOString() : undefined,
         });
 
-        // ─── 关联 persons（通过 topic.participants 匹配） ───
-        let persons = this.resolvePersonsFromTopics(topics);
+        // ─── 关联 persons（通过 topic.participants + topic.chatId 精确匹配） ───
+        let persons = this.resolvePersonsFromTopics(topics, { authorizedChatId, includeAllHistory });
 
         // 直接按 userId 查询（memory.md §4.4 Step 4）
         if (options?.userId) {
@@ -2056,7 +3071,12 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 if (options.chatId) {
                     const directProfile = this.getProfilesForChat(options.chatId)
                         .find(p => p.userId === options.userId);
-                    if (directProfile) persons = [directProfile, ...persons];
+                    if (directProfile) {
+                        persons = [
+                            this.sanitizeGroupProfileHistoryAccess(directProfile, { authorizedChatId, includeAllHistory }),
+                            ...persons,
+                        ];
+                    }
                 } else {
                     // 无 chatId 限定时查全部群的 profile
                     try {
@@ -2067,7 +3087,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                             const profile = this.getProfilesForChat(chat_id)
                                 .find(p => p.userId === options!.userId);
                             if (profile && !persons.some(e => e.userId === profile.userId && e.chatId === profile.chatId)) {
-                                persons.push(profile);
+                                persons.push(this.sanitizeGroupProfileHistoryAccess(profile, { authorizedChatId, includeAllHistory }));
                             }
                         }
                     } catch (err) {
@@ -2101,43 +3121,97 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         return { topics, facts, persons, deepSummary, sessionDigests };
     }
 
-    /** 从 topic 参与者解析关联的 person_group_profiles */
-    private resolvePersonsFromTopics(topics: TopicNode[]): PersonGroupProfile[] {
-        const userIds = new Set<string>();
+    /** 从 topic 参与者解析关联的 person_group_profiles（严格按 topic.chatId + userId） */
+    private resolvePersonsFromTopics(
+        topics: TopicNode[],
+        options?: { authorizedChatId?: string; includeAllHistory?: boolean },
+    ): PersonGroupProfile[] {
+        const seen = new Set<string>();
+        const pairs: Array<{ chatId: string; userId: string }> = [];
         for (const t of topics) {
-            for (const p of t.participants) userIds.add(p);
+            if (!t.chatId) continue;
+            for (const p of t.participants) {
+                if (!p) continue;
+                const key = `${t.chatId}\0${p}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                pairs.push({ chatId: t.chatId, userId: p });
+            }
         }
-        if (userIds.size === 0) return [];
+        if (pairs.length === 0) return [];
+
+        const selectStmt = this.db.prepare(`
+            SELECT p.*, i.display_name, gm.chat_title
+            FROM person_group_profiles p
+            LEFT JOIN person_identities i ON i.user_id = p.user_id
+            LEFT JOIN group_models gm ON gm.chat_id = p.chat_id
+            WHERE p.user_id = ? AND p.chat_id = ?
+            LIMIT 1
+        `);
 
         const result: PersonGroupProfile[] = [];
-        for (const uid of userIds) {
+        for (const { chatId, userId } of pairs) {
             try {
-                const rows = this.db.prepare(
-                    "SELECT * FROM person_group_profiles WHERE user_id = ? LIMIT 1"
-                ).all(uid) as Record<string, unknown>[];
-                for (const r of rows) {
-                     result.push({
-                        userId: r.user_id as string,
-                        chatId: r.chat_id as string,
-                        dunbarTier: (r.dunbar_tier as PersonGroupProfile["dunbarTier"]) ?? 4,
-                        dunbarReason: (r.dunbar_reason as string) ?? "",
-                        affinityScore: (r.affinity_score as number) ?? 0,
-                        traits: fromJSON<string[]>(r.traits as string, []),
-                        interests: fromJSON<string[]>(r.interests as string, []),
-                        communicationStyle: (r.communication_style as string) ?? "",
-                        relationToAgent: (r.relation_to_agent as string) ?? "",
-                        recentEpisodes: fromJSON<InteractionEpisode[]>(r.recent_episodes as string, []),
-                        mergedMemory: fromJSON<MergedMemory[]>(r.merged_memory as string, []),
-                        messageCount: (r.message_count as number) ?? 0,
-                        lastSeenAt: (r.last_seen_at as string) ?? "",
-                        activeHours: fromJSON<number[]>(r.active_hours as string, []),
-                        firstSeenAt: (r.first_seen_at as string) ?? "",
-                        updatedAt: (r.updated_at as string) ?? "",
-                    });
-                }
+                const r = selectStmt.get(userId, chatId) as Record<string, unknown> | undefined;
+                if (!r) continue;
+                const obj = this.profileRowToObj(r);
+                const chatDisplayName = this.getChatDisplayName(chatId, userId);
+                if (chatDisplayName) obj.displayName = chatDisplayName;
+                result.push(this.sanitizeGroupProfileHistoryAccess(obj, options));
             } catch { /* skip */ }
         }
         return result;
+    }
+
+    sanitizeGroupProfileHistoryAccess(
+        profile: PersonGroupProfile,
+        options?: { authorizedChatId?: string; includeAllHistory?: boolean },
+    ): PersonGroupProfile {
+        if (options?.includeAllHistory === true) return profile;
+        if (options?.authorizedChatId && profile.chatId === options.authorizedChatId) {
+            return profile;
+        }
+        const filteredEpisodes = (profile.recentEpisodes ?? []).filter(ep => ep.origin !== "offline_history");
+        let traits = profile.traits;
+        let interests = profile.interests;
+        let communicationStyle = profile.communicationStyle;
+
+        const seedRows = this.db.prepare(`
+            SELECT field, value_hash
+            FROM history_seed_fields
+            WHERE chat_id = ? AND entity_kind = 'member' AND entity_id = ?
+              AND field IN ('traits', 'interests', 'communicationStyle')
+        `).all(profile.chatId, profile.userId) as Array<{ field: string; value_hash: string }>;
+
+        if (seedRows.length > 0) {
+            const seedMap = new Map(seedRows.map(r => [r.field, r.value_hash]));
+            if (seedMap.get("traits") && seedMap.get("traits") === hashSeedValue(traits)) {
+                traits = [];
+            }
+            if (seedMap.get("interests") && seedMap.get("interests") === hashSeedValue(interests)) {
+                interests = [];
+            }
+            if (seedMap.get("communicationStyle") && seedMap.get("communicationStyle") === hashSeedValue(communicationStyle)) {
+                communicationStyle = "";
+            }
+        }
+
+        if (
+            filteredEpisodes.length === (profile.recentEpisodes ?? []).length
+            && traits === profile.traits
+            && interests === profile.interests
+            && communicationStyle === profile.communicationStyle
+        ) {
+            return profile;
+        }
+
+        return {
+            ...profile,
+            traits,
+            interests,
+            communicationStyle,
+            recentEpisodes: filteredEpisodes,
+        };
     }
 
     /** 估算 recall 结果的总 token 数（使用精确 tiktoken 计算） */
@@ -2183,7 +3257,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         let keywords: string[];
         let parsedHints = { ...request.hints };
 
-        if (resolveComponentProfiles("memory").length > 0 && !request.hints?.topicId) {
+        if (!request.skipIntentLlm && resolveComponentProfiles("memory").length > 0 && !request.hints?.topicId) {
             try {
                 const parsed = await this.parseIntentWithLLM(request.intent);
                 keywords = parsed.keywords;
@@ -2204,6 +3278,9 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
         // ─── Step 2: 定位 topics（向量搜索 + LIKE fallback） ───
         let topicRows: Record<string, unknown>[] = [];
+        const includeAllHistory = request.includeAllHistory === true;
+        const hasExplicitAuth = Object.prototype.hasOwnProperty.call(request, "authorizedChatId");
+        const authorizedChatId = hasExplicitAuth ? request.authorizedChatId : parsedHints.chatId;
 
         // 机会 1：向量搜索
         if (this.embeddingConfig) {
@@ -2211,7 +3288,10 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 const intentText = keywords.join(" ");
                 const [queryVec] = await embed([intentText], this.embeddingConfig);
                 if (queryVec) {
-                    const vecTopics = this.vectorSearchTopics(queryVec, maxSegments, parsedHints.chatId);
+                    const vecTopics = this.vectorSearchTopics(queryVec, maxSegments, parsedHints.chatId, {
+                        authorizedChatId,
+                        includeAllHistory,
+                    });
                     // 转为原始 row 兼容后续逻辑
                     if (vecTopics.length > 0) {
                         topicRows = vecTopics.map(t => ({
@@ -2240,7 +3320,18 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             }
 
             let whereClause = `WHERE (${conditions})`;
-            if (parsedHints.chatId) { whereClause += " AND chat_id = ?"; params.push(parsedHints.chatId); }
+            if (parsedHints.chatId) {
+                whereClause += " AND chat_id = ?";
+                params.push(parsedHints.chatId);
+            }
+            if (!includeAllHistory) {
+                if (authorizedChatId) {
+                    whereClause += " AND (history_key IS NULL OR chat_id = ?)";
+                    params.push(authorizedChatId);
+                } else {
+                    whereClause += " AND history_key IS NULL";
+                }
+            }
             if (parsedHints.daysBack) {
                 whereClause += " AND started_at >= ?";
                 params.push(new Date(Date.now() - parsedHints.daysBack * 86400000).toISOString());
@@ -2274,11 +3365,11 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             }
             if (messageIds.length === 0) continue;
 
-            // 用精确 message_ids 查询归属消息
+            // 用精确 message_ids 查询归属消息（严格过滤 access_control_blocked = 0）
             const placeholders = messageIds.map(() => "?").join(", ");
             const msgRows = this.db.prepare(`
                 SELECT * FROM message_log
-                WHERE chat_id = ? AND message_id IN (${placeholders})
+                WHERE chat_id = ? AND access_control_blocked = 0 AND message_id IN (${placeholders})
                 ORDER BY timestamp ASC, message_id ASC
             `).all(
                 chatId,
@@ -2308,7 +3399,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
         // ─── Step 4: 生成 answer（LLM 深度阅读 或 fallback） ───
         let answer: string;
-        if (resolveComponentProfiles("memory").length > 0 && segments.length > 0 && totalMessagesRead > 0) {
+        if (!request.skipIntentLlm && resolveComponentProfiles("memory").length > 0 && segments.length > 0 && totalMessagesRead > 0) {
             try {
                 answer = await this.deepReadWithLLM(request.intent, segments);
                 log.debug("browseHistory: LLM 深度阅读完成", { answerLen: answer.length });
@@ -2381,28 +3472,39 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
     // ─── Reflection 查询方法 ───
 
-    getTopicsSince(chatId: string, since: string): TopicNode[] {
-        const rows = this.db.prepare(
-            "SELECT * FROM topics WHERE chat_id = ? AND started_at >= ? ORDER BY started_at ASC"
-        ).all(chatId, since) as Record<string, unknown>[];
-        log.debug("getTopicsSince", { chatId, since, count: rows.length });
+    getTopicsSince(chatId: string, since: string, options?: { liveOnly?: boolean }): TopicNode[] {
+        const sql = options?.liveOnly
+            ? "SELECT * FROM topics WHERE chat_id = ? AND started_at >= ? AND history_key IS NULL ORDER BY started_at ASC"
+            : "SELECT * FROM topics WHERE chat_id = ? AND started_at >= ? ORDER BY started_at ASC";
+        const rows = this.db.prepare(sql).all(chatId, since) as Record<string, unknown>[];
+        log.debug("getTopicsSince", { chatId, since, liveOnly: options?.liveOnly, count: rows.length });
         return rows.map(r => this.rowToTopicNode(r));
     }
 
-    getRecentTopics(chatId: string, limit: number = 20): TopicNode[] {
+    getRecentTopics(chatId: string, limit: number = 20, options?: { liveOnly?: boolean }): TopicNode[] {
         if (!chatId || typeof chatId !== "string") {
             return [];
         }
-        const rows = this.db.prepare(
-            "SELECT * FROM topics WHERE chat_id = ? ORDER BY started_at DESC LIMIT ?"
-        ).all(chatId, limit) as Record<string, unknown>[];
-        log.debug("getRecentTopics", { chatId, limit, count: rows.length });
+        const sql = options?.liveOnly
+            ? "SELECT * FROM topics WHERE chat_id = ? AND history_key IS NULL ORDER BY started_at DESC LIMIT ?"
+            : "SELECT * FROM topics WHERE chat_id = ? ORDER BY started_at DESC LIMIT ?";
+        const rows = this.db.prepare(sql).all(chatId, limit) as Record<string, unknown>[];
+        log.debug("getRecentTopics", { chatId, limit, liveOnly: options?.liveOnly, count: rows.length });
         // 返回按时间正序（旧→新），与 getTopicsSince 行为一致
         return rows.map(r => this.rowToTopicNode(r)).reverse();
     }
 
-    getTopicById(topicId: string): TopicNode | null {
-        const row = this.db.prepare("SELECT * FROM topics WHERE id = ? LIMIT 1").get(topicId) as Record<string, unknown> | undefined;
+    getTopicById(topicId: string, options?: { liveOnly?: boolean; chatId?: string }): TopicNode | null {
+        const conditions = ["id = ?"];
+        const params: unknown[] = [topicId];
+        if (options?.liveOnly) {
+            conditions.push("history_key IS NULL");
+        }
+        if (options?.chatId) {
+            conditions.push("chat_id = ?");
+            params.push(options.chatId);
+        }
+        const row = this.db.prepare(`SELECT * FROM topics WHERE ${conditions.join(" AND ")} LIMIT 1`).get(...params) as Record<string, unknown> | undefined;
         return row ? this.rowToTopicNode(row) : null;
     }
 
@@ -2508,7 +3610,17 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
              LEFT JOIN group_models gm ON gm.chat_id = p.chat_id
              WHERE p.chat_id = ? ORDER BY p.message_count DESC`
         ).all(chatId) as Record<string, unknown>[];
-        const profiles = rows.map(r => this.profileRowToObj(r));
+        const chatNames = resolveLatestChatDisplayNames(
+            this.db,
+            chatId,
+            rows.map(r => r.user_id as string),
+        );
+        const profiles = rows.map(r => {
+            const obj = this.profileRowToObj(r);
+            const chatDisplayName = chatNames.get(obj.userId);
+            if (chatDisplayName) obj.displayName = chatDisplayName;
+            return obj;
+        });
         log.debug("getProfilesForChat", { chatId, count: profiles.length });
         return profiles;
     }
@@ -2521,20 +3633,27 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
              LEFT JOIN group_models gm ON gm.chat_id = p.chat_id
              WHERE p.user_id = ? ORDER BY p.message_count DESC`
         ).all(userId) as Record<string, unknown>[];
-        const profiles = rows.map(r => this.profileRowToObj(r));
+        const perChatNames = resolveLatestUserChatDisplayNames(this.db, userId);
+        const profiles = rows.map(r => {
+            const obj = this.profileRowToObj(r);
+            const chatDisplayName = perChatNames.get(obj.chatId);
+            if (chatDisplayName) obj.displayName = chatDisplayName;
+            return obj;
+        });
         log.debug("getProfilesForUser", { userId, count: profiles.length });
         return profiles;
     }
 
-    getRecentMessages(chatId: string, limit: number = 5): RecentMessageEntry[] {
+    getRecentMessages(chatId: string, limit: number = 5, options?: { includeBlocked?: boolean }): RecentMessageEntry[] {
         if (!chatId || typeof chatId !== "string") {
             return [];
         }
+        const blockedClause = options?.includeBlocked ? "" : "AND access_control_blocked = 0";
         const rows = this.db.prepare(
             `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions,
                     access_control_blocked
              FROM message_log
-             WHERE chat_id = ?
+             WHERE chat_id = ? ${blockedClause}
              ORDER BY timestamp DESC
              LIMIT ?`
         ).all(chatId, limit) as Record<string, unknown>[];
@@ -2610,6 +3729,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const row = this.db.prepare(
             `SELECT message_id, timestamp FROM message_log
              WHERE chat_id = ?
+               AND origin != 'qce'
              ORDER BY ${orderBy}
              LIMIT 1`
         ).get(chatId) as { message_id?: string; timestamp?: string } | undefined;
@@ -2618,7 +3738,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         return { messageId: String(row.message_id), timestamp: String(row.timestamp ?? "") };
     }
 
-    /** 本地 message_log 中出现过的会话（可按平台前缀过滤），用于决定补抓范围 */
+    /** 本地 message_log 中出现过的会话（可按平台前缀过滤），供 Dashboard / 管理视图使用 */
     listKnownChatIds(platformPrefix?: string): string[] {
         const rows = platformPrefix
             ? this.db.prepare(
@@ -2632,15 +3752,34 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         return rows.map((row) => String(row.chat_id));
     }
 
+    /** 仅包含非 QCE 导入消息的会话（用于启动补抓范围隔离，避免 QCE 会话触发 NapCat 拉取） */
+    listBackfillChatIds(platformPrefix?: string): string[] {
+        const rows = platformPrefix
+            ? this.db.prepare(
+                `SELECT chat_id, MAX(timestamp) AS last_ts FROM message_log
+                 WHERE chat_id LIKE ? AND origin != 'qce'
+                 GROUP BY chat_id ORDER BY last_ts DESC`
+            ).all(`${platformPrefix}:%`) as Record<string, unknown>[]
+            : this.db.prepare(
+                `SELECT chat_id, MAX(timestamp) AS last_ts FROM message_log
+                 WHERE origin != 'qce'
+                 GROUP BY chat_id ORDER BY last_ts DESC`
+            ).all() as Record<string, unknown>[];
+        return rows.map((row) => String(row.chat_id));
+    }
+
     searchFacts(query: string, options: {
         subject?: string;
         categories?: FactCategory[];
         limit?: number;
+        authorizedChatId?: string;
+        includeAllHistory?: boolean;
     } = {}): FactSearchResult[] {
         const ftsQuery = buildFtsOrQuery(query);
         if (!ftsQuery) return [];
 
         const limit = Math.min(Math.max(options.limit ?? 10, 1), 50);
+        const includeAllHistory = options.includeAllHistory === true;
         const sql = [
             `SELECT cf.id, cf.subject, cf.category, cf.content, cf.confidence,
                     cf.source_chat_id, cf.source_chat_title, cf.source_topic_id, cf.source_topic_label,
@@ -2653,6 +3792,14 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         ];
         const params: unknown[] = [ftsQuery];
 
+        if (!includeAllHistory) {
+            if (options.authorizedChatId) {
+                sql.push("AND (cf.history_key IS NULL OR cf.source_chat_id = ?)");
+                params.push(options.authorizedChatId);
+            } else {
+                sql.push("AND cf.history_key IS NULL");
+            }
+        }
         if (options.subject) {
             sql.push("AND cf.subject = ?");
             params.push(options.subject);
@@ -2692,12 +3839,17 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         before?: string;
         excludeTopicIds?: string[];
         limit?: number;
+        authorizedChatId?: string;
+        includeAllHistory?: boolean;
     } = {}): TopicSearchResult[] {
         if (!query || typeof query !== "string") {
             return [];
         }
         const ftsQuery = buildFtsOrQuery(query);
         const limit = Math.min(Math.max(options.limit ?? 5, 1), 30);
+        const includeAllHistory = options.includeAllHistory === true;
+        const hasExplicitAuth = Object.prototype.hasOwnProperty.call(options, "authorizedChatId");
+        const authorizedChatId = hasExplicitAuth ? options.authorizedChatId : options.chatId;
 
         // ── 查询时解析人名 → userId，用于按参与者搜索 ──
         const terms = query.split(/\s+/).map(t => t.replace(/"/g, "").trim()).filter(Boolean);
@@ -2738,6 +3890,14 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         if (options.chatId) {
             whereClauses.push("t.chat_id = ?");
             params.push(options.chatId);
+        }
+        if (!includeAllHistory) {
+            if (authorizedChatId) {
+                whereClauses.push("(t.history_key IS NULL OR t.chat_id = ?)");
+                params.push(authorizedChatId);
+            } else {
+                whereClauses.push("t.history_key IS NULL");
+            }
         }
         if (options.after) {
             whereClauses.push("t.started_at >= ?");
@@ -2788,7 +3948,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         limit?: number;
     } = {}): MessageSearchResult[] {
         const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
-        const conditions = ["text LIKE ?"];
+        const conditions = ["access_control_blocked = 0", "text LIKE ?"];
         const params: unknown[] = [`%${query}%`];
 
         if (options.chatId) {
@@ -2839,7 +3999,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         limit?: number;
     } = {}): MessageSearchResult[] {
         const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
-        const conditions: string[] = [];
+        const conditions: string[] = ["access_control_blocked = 0"];
         const params: unknown[] = [];
 
         const chatIds = [...new Set((options.chatIds ?? []).map(String).filter(Boolean))];
@@ -2899,23 +4059,48 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         }));
     }
 
-    getUserProfile(userId: string, chatId?: string): UserProfileSearchResult {
+    getUserProfile(
+        userId: string,
+        chatId?: string,
+        options?: { authorizedChatId?: string; includeAllHistory?: boolean },
+    ): UserProfileSearchResult {
         const identity = this.getPersonIdentity(userId);
         const globalProfile = this.getPersonProfile(userId);
-        const groupProfile = chatId
+        const includeAllHistory = options?.includeAllHistory === true;
+        const hasExplicitAuth = Boolean(options && Object.prototype.hasOwnProperty.call(options, "authorizedChatId"));
+        const authChatId = hasExplicitAuth ? options?.authorizedChatId : chatId;
+        const rawGroupProfile = chatId
             ? this.getProfilesForChat(chatId).find((profile) => profile.userId === userId) ?? null
             : null;
+        const groupProfile = rawGroupProfile
+            ? this.sanitizeGroupProfileHistoryAccess(rawGroupProfile, {
+                authorizedChatId: authChatId,
+                includeAllHistory,
+            })
+            : null;
+        const factConditions = [
+            "subject = ?",
+            "(expires_at IS NULL OR expires_at > datetime('now'))",
+        ];
+        const factParams: unknown[] = [userId];
+        if (!includeAllHistory) {
+            if (authChatId) {
+                factConditions.push("(history_key IS NULL OR source_chat_id = ?)");
+                factParams.push(authChatId);
+            } else {
+                factConditions.push("history_key IS NULL");
+            }
+        }
         const recentFacts = this.db.prepare(`
             SELECT id, subject, category, content, confidence,
                    source_chat_id, source_chat_title, source_topic_id, source_topic_label,
                    source_message_ids, source_interaction_ids, observed_at,
                    visibility, sensitivity, updated_at
             FROM core_facts
-            WHERE subject = ?
-              AND (expires_at IS NULL OR expires_at > datetime('now'))
+            WHERE ${factConditions.join(" AND ")}
             ORDER BY updated_at DESC
             LIMIT 5
-        `).all(userId) as Array<Record<string, unknown>>;
+        `).all(...factParams) as Array<Record<string, unknown>>;
 
         return {
             identity,
@@ -2978,11 +4163,13 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
     // ── 单条消息查询 ──
 
-    getMessageById(chatId: string, messageId: string): RecentMessageEntry | null {
+    getMessageById(chatId: string, messageId: string, options?: { includeBlocked?: boolean }): RecentMessageEntry | null {
+        const blockedClause = options?.includeBlocked ? "" : "AND access_control_blocked = 0";
         const row = this.db.prepare(
-            `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions
+            `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions,
+                    access_control_blocked
              FROM message_log
-             WHERE chat_id = ? AND message_id = ?
+             WHERE chat_id = ? AND message_id = ? ${blockedClause}
              LIMIT 1`
         ).get(chatId, messageId) as Record<string, unknown> | undefined;
 
@@ -2999,6 +4186,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             mediaType: (row.media_type as string) ?? undefined,
             mediaInfo: (row.media_info as string) ?? undefined,
             mentions: readMessageMentions(row.mentions),
+            ...(Number(row.access_control_blocked) === 1 ? { accessControlBlocked: true } : {}),
         };
     }
 
@@ -3024,7 +4212,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                     const beforeCtx = this.db.prepare(`
                         SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions
                         FROM message_log 
-                        WHERE chat_id = ? AND user_id = ? AND timestamp <= ?
+                        WHERE chat_id = ? AND user_id = ? AND access_control_blocked = 0 AND timestamp <= ?
                         ORDER BY timestamp DESC
                         LIMIT ?
                     `).all(chatId, parent.userId, parent.timestamp, limitPerNode + 1) as Record<string, unknown>[];
@@ -3033,7 +4221,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                     const afterCtx = this.db.prepare(`
                         SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions
                         FROM message_log 
-                        WHERE chat_id = ? AND user_id = ? AND timestamp > ?
+                        WHERE chat_id = ? AND user_id = ? AND access_control_blocked = 0 AND timestamp > ?
                         ORDER BY timestamp ASC
                         LIMIT ?
                     `).all(chatId, parent.userId, parent.timestamp, limitPerNode) as Record<string, unknown>[];
@@ -3068,21 +4256,23 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
     }
 
     /** 批量按 messageId 获取消息（保持 messageIds 顺序） */
-    getMessagesByIds(chatId: string, messageIds: string[]): RecentMessageEntry[] {
+    getMessagesByIds(chatId: string, messageIds: string[], options?: { includeBlocked?: boolean }): RecentMessageEntry[] {
         if (messageIds.length === 0) return [];
 
         const result: RecentMessageEntry[] = [];
         // 分批避免 SQLite IN 参数过多
         const CHUNK = 200;
         const byId = new Map<string, RecentMessageEntry>();
+        const blockedClause = options?.includeBlocked ? "" : "AND access_control_blocked = 0";
 
         for (let i = 0; i < messageIds.length; i += CHUNK) {
             const chunk = messageIds.slice(i, i + CHUNK);
             const placeholders = chunk.map(() => "?").join(", ");
             const rows = this.db.prepare(
-                `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions
+                `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions,
+                        access_control_blocked
                  FROM message_log
-                 WHERE chat_id = ? AND message_id IN (${placeholders})`
+                 WHERE chat_id = ? ${blockedClause} AND message_id IN (${placeholders})`
             ).all(chatId, ...chunk) as Record<string, unknown>[];
 
             for (const row of rows) {
@@ -3097,6 +4287,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                     mediaType: (row.media_type as string) ?? undefined,
                     mediaInfo: (row.media_info as string) ?? undefined,
                     mentions: readMessageMentions(row.mentions),
+                    ...(Number(row.access_control_blocked) === 1 ? { accessControlBlocked: true } : {}),
                 };
                 byId.set(entry.messageId, entry);
             }
@@ -3113,9 +4304,14 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
     }
 
     /** 按起止 messageId 重建一段时间连续的消息窗口（包含 agent 自己落盘的消息）。 */
-    getMessagesBetweenIds(chatId: string, startMessageId: string, endMessageId: string): RecentMessageEntry[] {
-        const start = this.getMessageById(chatId, startMessageId);
-        const end = this.getMessageById(chatId, endMessageId);
+    getMessagesBetweenIds(
+        chatId: string,
+        startMessageId: string,
+        endMessageId: string,
+        options?: { includeBlocked?: boolean },
+    ): RecentMessageEntry[] {
+        const start = this.getMessageById(chatId, startMessageId, options);
+        const end = this.getMessageById(chatId, endMessageId, options);
         if (!start || !end) {
             log.debug("getMessagesBetweenIds: boundary not found", {
                 chatId,
@@ -3129,10 +4325,13 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
         const from = start.timestamp <= end.timestamp ? start.timestamp : end.timestamp;
         const to = start.timestamp <= end.timestamp ? end.timestamp : start.timestamp;
+        const blockedClause = options?.includeBlocked ? "" : "AND access_control_blocked = 0";
         const rows = this.db.prepare(
-            `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions
+            `SELECT message_id, chat_id, user_id, display_name, text, reply_to_message_id, timestamp, media_type, media_info, mentions,
+                    access_control_blocked
              FROM message_log
              WHERE chat_id = ?
+               ${blockedClause}
                AND timestamp >= ?
                AND timestamp <= ?
              ORDER BY timestamp ASC, rowid ASC`
@@ -3149,6 +4348,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             mediaType: (row.media_type as string) ?? undefined,
             mediaInfo: (row.media_info as string) ?? undefined,
             mentions: readMessageMentions(row.mentions),
+            ...(Number(row.access_control_blocked) === 1 ? { accessControlBlocked: true } : {}),
         }));
 
         log.debug("getMessagesBetweenIds", {
@@ -3464,7 +4664,15 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
     }
 
     /** 分页列出/过滤 core_facts */
-    listCoreFacts(options?: { subject?: string; category?: string; sourceChatId?: string; limit?: number; offset?: number }): { items: CoreFact[]; total: number } {
+    listCoreFacts(options?: {
+        subject?: string;
+        category?: string;
+        sourceChatId?: string;
+        authorizedChatId?: string;
+        includeAllHistory?: boolean;
+        limit?: number;
+        offset?: number;
+    }): { items: CoreFact[]; total: number } {
         const limit = options?.limit ?? 50;
         const offset = options?.offset ?? 0;
 
@@ -3486,6 +4694,18 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             countSql += " AND source_chat_id = ?";
             querySql += " AND source_chat_id = ?";
             params.push(options.sourceChatId);
+        }
+        const shouldScopeHistory = options?.includeAllHistory === false
+            || (options?.includeAllHistory !== true && options?.authorizedChatId !== undefined);
+        if (shouldScopeHistory) {
+            if (options?.authorizedChatId) {
+                countSql += " AND (history_key IS NULL OR source_chat_id = ?)";
+                querySql += " AND (history_key IS NULL OR source_chat_id = ?)";
+                params.push(options.authorizedChatId);
+            } else {
+                countSql += " AND history_key IS NULL";
+                querySql += " AND history_key IS NULL";
+            }
         }
 
         const total = (this.db.prepare(countSql).get(...params) as { cnt: number }).cnt;
@@ -3510,6 +4730,8 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
                 observedAt: (row.observed_at as string) ?? null,
                 visibility: ((row.visibility as string) ?? "contextual") as CoreFact["visibility"],
                 sensitivity: ((row.sensitivity as string) ?? "low") as CoreFact["sensitivity"],
+                historyKey: (row.history_key as string) ?? null,
+                historyReview: (row.history_review as "approved" | null) ?? null,
                 createdAt: row.created_at as string,
                 updatedAt: row.updated_at as string,
                 expiresAt: (row.expires_at as string) ?? null,
@@ -3524,6 +4746,11 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         confidence?: number;
         expiresAt?: string | null;
     } & CoreFactProvenance): boolean {
+        const existing = this.db.prepare(
+            "SELECT rowid, subject, content, history_key FROM core_facts WHERE id = ?"
+        ).get(id) as { rowid: number; subject: string; content: string; history_key: string | null } | undefined;
+        if (!existing) return false;
+
         const ts = now();
         const builder = new SafeUpdateBuilder("core_facts");
         if (data.content !== undefined) builder.set("content", data.content);
@@ -3539,6 +4766,13 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         if (data.observedAt !== undefined) builder.set("observed_at", data.observedAt);
         if (data.visibility !== undefined) builder.set("visibility", data.visibility);
         if (data.sensitivity !== undefined) builder.set("sensitivity", data.sensitivity);
+        if (existing.history_key !== null) {
+            builder.set("history_review", "approved");
+        }
+        const contentChanged = data.content !== undefined && data.content !== existing.content;
+        if (contentChanged) {
+            builder.set("embedding", null);
+        }
         builder.set("updated_at", ts);
         builder.where("id", id);
 
@@ -3546,14 +4780,17 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         const { sql, params } = builder.build();
         const result = this.db.prepare(sql).run(...params);
 
+        if (result.changes > 0 && contentChanged && this.sqliteVecAvailable) {
+            try {
+                this.db.prepare("DELETE FROM facts_vec WHERE fact_id = ?").run(id);
+            } catch { /* vec cleanup */ }
+        }
+
         // 同步 FTS5
         if (data.content !== undefined) {
             try {
-                const row = this.db.prepare("SELECT rowid, subject FROM core_facts WHERE id = ?").get(id) as { rowid: number; subject: string } | undefined;
-                if (row) {
-                    this.db.prepare("DELETE FROM core_facts_fts WHERE rowid = ?").run(row.rowid);
-                    this.db.prepare("INSERT INTO core_facts_fts(rowid, content, subject) VALUES (?, ?, ?)").run(row.rowid, data.content, row.subject);
-                }
+                this.db.prepare("DELETE FROM core_facts_fts WHERE rowid = ?").run(existing.rowid);
+                this.db.prepare("INSERT INTO core_facts_fts(rowid, content, subject) VALUES (?, ?, ?)").run(existing.rowid, data.content, existing.subject);
             } catch { /* FTS sync */ }
         }
 
@@ -3669,13 +4906,27 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
 
     /** 批量删除 message_log 中的消息 */
     deleteMessages(chatId: string, messageIds: string[]): number {
-        if (messageIds.length === 0) return 0;
-        const placeholders = messageIds.map(() => "?").join(", ");
-        const result = this.db.prepare(
-            `DELETE FROM message_log WHERE chat_id = ? AND message_id IN (${placeholders})`
-        ).run(chatId, ...messageIds);
-        log.info("deleteMessages", { chatId, count: messageIds.length, deleted: result.changes });
-        return result.changes;
+        const uniqueMessageIds = [...new Set(
+            messageIds.map(id => (typeof id === "string" ? id.trim() : "")).filter(Boolean),
+        )];
+        if (!chatId || uniqueMessageIds.length === 0) return 0;
+        const runDelete = this.db.transaction(() => {
+            this.historyStore.reverseDeletedMessageStats(chatId, uniqueMessageIds);
+            let deleted = 0;
+            const CHUNK = 200;
+            for (let i = 0; i < uniqueMessageIds.length; i += CHUNK) {
+                const chunk = uniqueMessageIds.slice(i, i + CHUNK);
+                const placeholders = chunk.map(() => "?").join(", ");
+                const result = this.db.prepare(
+                    `DELETE FROM message_log WHERE chat_id = ? AND message_id IN (${placeholders})`
+                ).run(chatId, ...chunk);
+                deleted += result.changes;
+            }
+            return deleted;
+        });
+        const deleted = runDelete();
+        log.info("deleteMessages", { chatId, count: uniqueMessageIds.length, deleted });
+        return deleted;
     }
 
     /** 更新 message_log 中单条消息的文本 */
@@ -3687,9 +4938,21 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         builder.where("message_id", messageId);
         if (!builder.hasSets) return false;
         const { sql, params } = builder.build();
-        const result = this.db.prepare(sql).run(...params);
-        log.info("updateMessage", { chatId, messageId, changed: result.changes > 0 });
-        return result.changes > 0;
+        const runUpdate = this.db.transaction(() => {
+            const result = this.db.prepare(sql).run(...params);
+            if (result.changes > 0) {
+                if (data.displayName !== undefined) {
+                    deleteSenderChatNamesForMessage(this.db, chatId, messageId);
+                }
+                if (data.text !== undefined) {
+                    deleteSelfClaimChatNamesForMessage(this.db, chatId, messageId);
+                }
+            }
+            return result.changes > 0;
+        });
+        const changed = runUpdate();
+        log.info("updateMessage", { chatId, messageId, changed });
+        return changed;
     }
 
     /** 按 ID 删除 interaction */
@@ -3845,6 +5108,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
             keywords: fromJSON(row.keywords as string, []),
             associatedMemories: fromJSON<AssociatedMemory[]>(row.associated_memories as string, []),
             callbackPotential: Number(row.callback_potential ?? 0),
+            historyKey: (row.history_key as string) ?? null,
             embedding: row.embedding ? bufferToEmbedding(row.embedding as Buffer) : undefined,
             createdAt: row.created_at as string,
             updatedAt: row.updated_at as string,

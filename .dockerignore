@@ -11,6 +11,7 @@ workspace
 .env.*
 .tmp
 *.md
+!system-prompts/**/*.md
 config.yaml
 tests
 docs

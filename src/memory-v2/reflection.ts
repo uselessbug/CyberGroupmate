@@ -101,6 +101,7 @@ interface ReflectionLLMOutput {
         sourceMessageIds?: string[];
         displayName?: string;
         aliases?: string[];
+        chatNames?: string[];
     }>;
     relationshipEvents?: Array<{
         userId: string;
@@ -244,10 +245,11 @@ export async function runReflection(
     log.info("Reflection 开始", { chatId });
 
     // ── Step 1: 数据收集 ──
-    const groupModel = memory.getGroupModel(chatId);
-    const since = groupModel?.lastReflectedAt ?? "1970-01-01T00:00:00.000Z";
+    const exactGroupModel = memory.getGroupModel(chatId);
+    const groupModel = memory.getGroupCultureModel?.(chatId) ?? exactGroupModel;
+    const since = exactGroupModel?.lastReflectedAt ?? "1970-01-01T00:00:00.000Z";
 
-    const topics = memory.getTopicsSince(chatId, since);
+    const topics = memory.getTopicsSince(chatId, since, { liveOnly: true });
     const interactions = memory.getInteractionsSince(chatId, since);
     const profiles = memory.getProfilesForChat(chatId);
 
@@ -283,10 +285,23 @@ export async function runReflection(
     };
     let llmSucceeded = false;
     let lastError: unknown = null;
+    let shownMessageIds = new Set<string>();
 
     for (let level = 0; level < REFLECTION_SCOPE_LEVELS.length; level++) {
         const scope = REFLECTION_SCOPE_LEVELS[level];
-        const prompt = buildReflectionPrompt(topics, interactions, profiles, stats, groupModel, isDirectMessage, memory, scope);
+        const attemptShownMessageIds = new Set<string>();
+        const prompt = buildReflectionPrompt(
+            topics,
+            interactions,
+            profiles,
+            stats,
+            groupModel,
+            isDirectMessage,
+            memory,
+            scope,
+            attemptShownMessageIds,
+            chatId,
+        );
         const messages: ChatMessage[] = [
             { role: "system", content: getReflectionSystemPrompt() },
             { role: "user", content: prompt },
@@ -310,6 +325,7 @@ export async function runReflection(
             } else {
                 log.warn("Reflection LLM 返回无法解析，使用空默认值", { scope: scope.label });
             }
+            shownMessageIds = attemptShownMessageIds;
             llmSucceeded = true;
             break;
         } catch (err) {
@@ -356,25 +372,53 @@ export async function runReflection(
     const personUpdates: ReflectionResult["personUpdates"] = [];
     const newCoreFacts: string[] = [];
 
-    // 4a′. 更新 person_identities（displayName/aliases 变化）
+    // 4a′. 更新 person_identities / person_chat_names（displayName/aliases/chatNames 变化）
     if (llmOutput.identityUpdates?.length) {
+        const localOnly = chatId.startsWith("onebot:") || isDirectMessage;
         for (const iu of llmOutput.identityUpdates) {
             if (typeof iu.userId !== "string" || !Array.isArray(iu.sourceMessageIds)) continue;
             const compositeUid = ensureCompositeId(getPlatform(chatId), iu.userId);
-            const sourceIds = iu.sourceMessageIds.filter((id): id is string => typeof id === "string").slice(0, 20);
-            const evidence = memory.getMessagesByIds(chatId, sourceIds);
-            const idData = groundedIdentityUpdate(compositeUid, iu, evidence, memory.getPersonIdentity(compositeUid)?.aliases);
-            if (Object.keys(idData).length > 0) {
-                memory.upsertPersonIdentity(compositeUid, idData);
-                log.debug("Reflection 4a′: 更新身份信息", { userId: compositeUid, ...idData });
+            const sourceIds = iu.sourceMessageIds
+                .filter((id): id is string => typeof id === "string" && shownMessageIds.has(id))
+                .slice(0, 20);
+            if (sourceIds.length === 0) continue;
+            const evidence = memory.getMessagesByIds(chatId, sourceIds)
+                .filter(m => m.chatId === chatId && m.accessControlBlocked !== true);
+            const idData = groundedIdentityUpdate(
+                compositeUid,
+                iu,
+                evidence,
+                memory.getPersonIdentity(compositeUid)?.aliases,
+                { chatId, localOnly },
+            );
+            if (idData.chatNames?.length) {
+                memory.insertChatNameObservations(idData.chatNames);
+            }
+            if (idData.displayName !== undefined || idData.aliases !== undefined) {
+                memory.upsertPersonIdentity(compositeUid, {
+                    ...(idData.displayName !== undefined ? { displayName: idData.displayName } : {}),
+                    ...(idData.aliases !== undefined ? { aliases: idData.aliases } : {}),
+                });
+            }
+            if (idData.chatNames?.length || idData.displayName !== undefined || idData.aliases !== undefined) {
+                log.debug("Reflection 4a′: 更新身份信息", {
+                    userId: compositeUid,
+                    aliases: idData.aliases,
+                    chatNamesCount: idData.chatNames?.length ?? 0,
+                });
             }
         }
     }
 
     // 4a-global. 写入跨群全局画像（同一个人在不同 chat 共享的长期认知）
+    // 必须具备本轮真实 live 交互或非拦截 live 消息证据，禁止零 live 证据时将离线历史提升为全局画像。
     if (llmOutput.globalPersonUpdates?.length) {
         for (const gu of llmOutput.globalPersonUpdates) {
             const compositeUid = ensureCompositeId(getPlatform(chatId), gu.userId);
+            if (!hasEligibleLiveEvidenceForUser(compositeUid, chatId, topics, interactions, memory)) {
+                log.debug("Reflection 4a-global: 缺少 live 证据，跳过全局画像写入", { userId: compositeUid, chatId });
+                continue;
+            }
             const existing = memory.getPersonProfile(compositeUid);
             const updateData = mergeGlobalPersonProfile(existing, gu, chatId, startTime);
             memory.upsertPersonProfile(compositeUid, updateData);
@@ -471,12 +515,20 @@ export async function runReflection(
     for (let i = 0; i < llmOutput.factUpdates.length; i++) {
         const fact = llmOutput.factUpdates[i];
         if (fact.action === "delete" && fact.id) {
+            if (memory.isHistoricalFact?.(fact.id)) {
+                log.warn("Reflection 4b: 拒绝删除受保护的历史事实", { id: fact.id });
+                continue;
+            }
             // 删除已有 fact
             const deleted = memory.deleteFact(fact.id);
             log.debug("Reflection 4b: 删除事实", { id: fact.id, deleted });
             continue;
         }
         if (fact.id) {
+            if (memory.isHistoricalFact?.(fact.id)) {
+                log.warn("Reflection 4b: 拒绝修改受保护的历史事实", { id: fact.id });
+                continue;
+            }
             // 更新已有 fact
             memory.updateFact(fact.id, {
                 content: fact.content,
@@ -579,7 +631,7 @@ export async function runReflection(
 
     // 将 reflection 对 agent 行为的洞察追加到 recentFeedback，使其被 attend 上下文自动消费
     if (reflectionFeedback.length > 0) {
-        const existingFeedback = groupUpdateData.recentFeedback || groupModel?.recentFeedback || "";
+        const existingFeedback = groupUpdateData.recentFeedback || exactGroupModel?.recentFeedback || "";
         groupUpdateData.recentFeedback = existingFeedback
             ? `${existingFeedback}\n${reflectionFeedback.join("\n")}`
             : reflectionFeedback.join("\n");
@@ -1027,6 +1079,23 @@ function applyTemplate(tpl: string, vars: Record<string, string>): string {
     );
 }
 
+function formatTrustedMentionsAnnotation(mentions: RecentMessageEntry["mentions"], chatId?: string): string {
+    if (!mentions?.length) return "";
+    const isOneBot = Boolean(chatId && chatId.startsWith("onebot:"));
+    const parts = mentions
+        .filter(m => {
+            if (!m.userId || m.isAll || m.nameSource === "account_fallback" || !m.displayName?.trim()) {
+                return false;
+            }
+            if (isOneBot && m.nameSource !== "chat" && m.nameSource !== "qce") {
+                return false;
+            }
+            return true;
+        })
+        .map(m => `@${m.displayName!.trim()} [${m.userId}]`);
+    return parts.length > 0 ? ` [提及映射: ${parts.join(", ")}]` : "";
+}
+
 function buildReflectionPrompt(
     topics: TopicNode[],
     interactions: InteractionEpisode[],
@@ -1036,11 +1105,18 @@ function buildReflectionPrompt(
     isDirectMessage: boolean = false,
     memory?: MemoryStoreV2,
     scope?: ReflectionScope,
+    shownMessageIds?: Set<string>,
+    chatIdParam?: string,
 ): string {
     const sections: string[] = [];
     const MAX_TOPIC_BLOCKS = scope?.maxTopicBlocks ?? 60;
     const MAX_MESSAGES_PER_TOPIC = scope?.maxMessagesPerTopic ?? 30;
     const MAX_INTERACTIONS = scope?.maxInteractions ?? 80;
+    const activeChatId = chatIdParam ?? groupModel?.chatId ?? topics[0]?.chatId ?? interactions[0]?.chatId ?? profiles[0]?.chatId;
+    const chatNameMap = new Map<string, string>();
+    for (const p of profiles) {
+        if (p.displayName?.trim()) chatNameMap.set(p.userId, p.displayName.trim());
+    }
 
     // 基本信息（私聊 vs 群聊）
     if (groupModel) {
@@ -1078,20 +1154,27 @@ function buildReflectionPrompt(
             let conversationText = "";
             if (t.messageRange.messageIds.length > 0) {
                 const messageIds = t.messageRange.messageIds.slice(-MAX_MESSAGES_PER_TOPIC);
-                const msgs = memory.getMessagesByIds(chatId, messageIds);
+                const msgs = memory.getMessagesByIds(chatId, messageIds)
+                    .filter(m => m.accessControlBlocked !== true);
                 if (msgs.length > 0) {
+                    for (const m of msgs) {
+                        shownMessageIds?.add(m.messageId);
+                    }
                     // RecentMessageEntry → RawMessage
-                    const rawMsgs: RawMessage[] = msgs.map(m => ({
-                        id: m.messageId,
-                        sender: m.displayName || m.userId,
-                        userId: m.userId,
-                        mentions: m.mentions,
-                        text: m.text,
-                        timestamp: m.timestamp,
-                        replyToMsgId: m.replyToMessageId,
-                        mediaType: m.mediaType,
-                        mediaInfo: m.mediaInfo,
-                    }));
+                    const rawMsgs: RawMessage[] = msgs.map(m => {
+                        const mentionAnnotation = formatTrustedMentionsAnnotation(m.mentions, chatId);
+                        return {
+                            id: m.messageId,
+                            sender: m.displayName || m.userId,
+                            userId: m.userId,
+                            mentions: m.mentions,
+                            text: mentionAnnotation ? `${m.text}${mentionAnnotation}` : m.text,
+                            timestamp: m.timestamp,
+                            replyToMsgId: m.replyToMessageId,
+                            mediaType: m.mediaType,
+                            mediaInfo: m.mediaInfo,
+                        };
+                    });
                     conversationText = formatMessages(rawMsgs, []);
                 }
             }
@@ -1134,7 +1217,7 @@ function buildReflectionPrompt(
     // 参与者量化数据
     if (stats.size > 0) {
         const statLines = Array.from(stats.values()).map(s =>
-            `- ${formatUserLabel(memory, s.userId)}: ${s.messageCount} 条消息, ${s.topicsParticipated} 个话题, ` +
+            `- ${formatUserLabel(memory, s.userId, chatNameMap.get(s.userId), activeChatId)}: ${s.messageCount} 条消息, ${s.topicsParticipated} 个话题, ` +
             `${s.directInteractions} 次直呼/私聊, ${s.agentReplies} 次 agent 回复, ${s.activeDays.size} 天活跃, ` +
             `互动类型=${formatCountMap(s.interactionTypes)}`
         ).join("\n");
@@ -1147,9 +1230,9 @@ function buildReflectionPrompt(
             const globalLines = profiles.map(p => {
                 const global = memory.getPersonProfile(p.userId);
                 if (!global) {
-                    return `- **${formatUserLabel(memory, p.userId)}**: (暂无全局画像，需从本次和跨群事实中提炼稳定认知)`;
+                    return `- **${formatUserLabel(memory, p.userId, p.displayName, activeChatId)}**: (暂无全局画像，需从本次和跨群事实中提炼稳定认知)`;
                 }
-                return `- **${formatUserLabel(memory, p.userId)}**: traits=[${global.traits.join(", ")}], interests=[${global.interests.join(", ")}], ` +
+                return `- **${formatUserLabel(memory, p.userId, p.displayName, activeChatId)}**: traits=[${global.traits.join(", ")}], interests=[${global.interests.join(", ")}], ` +
                     `style="${global.communicationStyle}", relation="${global.relationToAgent}", ` +
                     `patterns=[${global.stablePatterns.join("；")}], hints=[${global.agentPolicyHints.join("；")}], ` +
                     `candidates=[${global.followupCandidates.join("；")}], ` +
@@ -1168,7 +1251,7 @@ function buildReflectionPrompt(
                 ].filter(Boolean).join(", ")})`
                 : "";
             const relationshipMemory = formatRelationshipMemoryBrief(p);
-            return `- **${formatUserLabel(memory, p.userId)}**${namePart} (Tier ${p.dunbarTier}): ` +
+            return `- **${formatUserLabel(memory, p.userId, p.displayName, activeChatId)}**${namePart} (Tier ${p.dunbarTier}): ` +
                 `traits=[${p.traits.join(", ")}], interests=[${p.interests.join(", ")}], ` +
                 `style="${p.communicationStyle}", relation="${p.relationToAgent}"` +
                 (relationshipMemory ? `\n  ${relationshipMemory}` : "");
@@ -1180,7 +1263,12 @@ function buildReflectionPrompt(
     if (memory && profiles.length > 0) {
         const factLines: string[] = [];
         for (const p of profiles) {
-            const result = memory.listCoreFacts({ subject: p.userId, limit: 10 });
+            const result = memory.listCoreFacts({
+                subject: p.userId,
+                limit: 10,
+                authorizedChatId: activeChatId,
+                includeAllHistory: false,
+            });
             const facts = result.items;
             if (facts.length > 0) {
                 for (const f of facts) {
@@ -1191,7 +1279,7 @@ function buildReflectionPrompt(
                         f.visibility ? `visibility=${f.visibility}` : "",
                         f.sensitivity ? `sensitivity=${f.sensitivity}` : "",
                     ].filter(Boolean).join(" | ");
-                    factLines.push(`- [id:${f.id}] (${f.category}) ${formatUserLabel(memory, f.subject)}: ${f.content}${source ? ` (${source})` : ""}`);
+                    factLines.push(`- [id:${f.id}] (${f.category}) ${formatUserLabel(memory, f.subject, p.displayName, activeChatId)}: ${f.content}${source ? ` (${source})` : ""}`);
                 }
             }
         }
@@ -1216,9 +1304,10 @@ function formatCountMap(map: Map<string, number> | Record<string, number> | unde
     return entries.map(([key, value]) => `${key}:${value}`).join(", ");
 }
 
-function formatUserLabel(memory: MemoryStoreV2 | undefined, userId: string, fallbackName?: string): string {
+function formatUserLabel(memory: MemoryStoreV2 | undefined, userId: string, fallbackName?: string, chatId?: string): string {
+    const chatName = chatId ? memory?.getChatDisplayName?.(chatId, userId) : null;
     const identity = memory?.getPersonIdentity(userId);
-    const name = identity?.displayName?.trim() || fallbackName?.trim() || userId;
+    const name = chatName?.trim() || identity?.displayName?.trim() || fallbackName?.trim() || userId;
     return `${name}(${userId})`;
 }
 
@@ -1258,8 +1347,40 @@ function chooseProfileText(existing?: string, incoming?: string): string {
     return next || (existing?.trim() ?? "");
 }
 
+function hasEligibleLiveEvidenceForUser(
+    compositeUid: string,
+    chatId: string,
+    topics: TopicNode[],
+    interactions: InteractionEpisode[],
+    memory: MemoryStoreV2,
+): boolean {
+    const rawUid = getRawId(compositeUid);
+    const matchesUid = (uid: string | undefined | null): boolean =>
+        Boolean(uid && (uid === compositeUid || getRawId(uid) === rawUid));
+
+    if (interactions.some(intr => matchesUid(intr.userId))) {
+        return true;
+    }
+
+    for (const topic of topics) {
+        if (topic.chatId !== chatId || topic.historyKey != null) continue;
+        if (!topic.participants.some(pid => matchesUid(pid))) continue;
+        if (topic.messageRange.messageIds.length === 0) {
+            return true;
+        }
+        const liveMsgs = memory.getMessagesByIds(chatId, topic.messageRange.messageIds)
+            .filter(m => m.accessControlBlocked !== true);
+        if (liveMsgs.some(m => matchesUid(m.userId))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 function formatRelationshipMemoryBrief(profile: PersonGroupProfile): string {
     const recent = (profile.recentEpisodes ?? [])
+        .filter(ep => ep.origin !== "offline_history")
         .slice(-3)
         .map(ep => `${ep.topicLabel ? `${ep.topicLabel}: ` : ""}${ep.summary}`)
         .filter(Boolean);
@@ -1326,7 +1447,7 @@ function formatInteractionForPrompt(
         ? ` | 证据: ${evidence.map(formatMessageEvidence).join(" / ")}`
         : "";
     const topicText = topic ? ` | 话题: ${topic.label}` : "";
-    return `- [${interaction.date}] ${formatUserLabel(memory, interaction.userId)} ${interaction.type} ` +
+    return `- [${interaction.date}] ${formatUserLabel(memory, interaction.userId, undefined, interaction.chatId)} ${interaction.type} ` +
         `(情感:${interaction.sentiment}, 重要度:${interaction.significance}) ${interaction.summary}${topicText}${evidenceText}`;
 }
 
@@ -1357,7 +1478,7 @@ function buildRelationshipEpisodes(options: {
 
         result.push({
             ...intr,
-            displayName: memory.getPersonIdentity(intr.userId)?.displayName,
+            displayName: memory.getChatDisplayName?.(chatId, intr.userId) ?? memory.getPersonIdentity(intr.userId)?.displayName,
             direction: inferDirection(intr),
             interactionQuality: qualityMap.get(intr.userId),
             topicId: intr.topicId ?? topic?.id ?? null,
@@ -1378,9 +1499,10 @@ function buildRelationshipEpisodes(options: {
         if (!event.userId || !event.summary) continue;
         const userId = ensureCompositeId(getPlatform(chatId), event.userId);
         const topic = event.topicId
-            ? topics.find(t => t.id === event.topicId) ?? memory.getTopicById(event.topicId)
+            ? topics.find(t => t.id === event.topicId && t.chatId === chatId && t.historyKey == null)
+                ?? memory.getTopicById(event.topicId, { liveOnly: true, chatId })
             : event.topicLabel
-                ? topics.find(t => t.label === event.topicLabel)
+                ? topics.find(t => t.label === event.topicLabel && t.chatId === chatId && t.historyKey == null)
                 : null;
         const messageIds = [...new Set(event.messageIds ?? [])];
         result.push({
@@ -1393,7 +1515,7 @@ function buildRelationshipEpisodes(options: {
             summary: event.summary,
             sentiment: event.sentiment ?? "neutral",
             significance: clamp01(event.significance ?? 0.75),
-            displayName: memory.getPersonIdentity(userId)?.displayName,
+            displayName: memory.getChatDisplayName?.(chatId, userId) ?? memory.getPersonIdentity(userId)?.displayName,
             direction: "mixed",
             interactionQuality: event.interactionQuality,
             topicLabel: event.topicLabel ?? topic?.label,
@@ -1419,8 +1541,12 @@ function inferTopicForInteraction(
     memory?: MemoryStoreV2,
 ): TopicNode | null {
     if (interaction.topicId) {
-        const existing = topics.find(t => t.id === interaction.topicId) ?? memory?.getTopicById(interaction.topicId) ?? null;
-        if (existing) return existing;
+        const inList = topics.find(
+            t => t.id === interaction.topicId && t.chatId === interaction.chatId && t.historyKey == null,
+        );
+        if (inList) return inList;
+        const fromDb = memory?.getTopicById(interaction.topicId, { liveOnly: true, chatId: interaction.chatId }) ?? null;
+        if (fromDb && fromDb.chatId === interaction.chatId && fromDb.historyKey == null) return fromDb;
     }
     const interactionTime = new Date(interaction.date).getTime();
     if (!Number.isFinite(interactionTime)) return null;
@@ -1446,6 +1572,7 @@ function findEvidenceMessages(
     const byId = new Map<string, RecentMessageEntry>();
     if (topic?.messageRange.messageIds.length) {
         for (const msg of memory.getMessagesByIds(interaction.chatId, topic.messageRange.messageIds)) {
+            if (msg.accessControlBlocked === true) continue;
             if (msg.userId === interaction.userId || topic.messageRange.messageIds.length <= 8) {
                 byId.set(msg.messageId, msg);
             }
@@ -1636,15 +1763,18 @@ export function trimProfileByTier(
 
     // 裁剪 recentEpisodes（按天数）。最低保留到 episode->week 合并线之后，
     // 避免 Tier 3/4 的事件在有机会进入 mergedMemory 前被直接丢弃。
+    // 离线历史初始化生成的 episode (origin === "offline_history") 不受 live 裁剪影响，原样保留。
     const episodes = profile.recentEpisodes ?? [];
     if (episodes.length > 0) {
+        const liveEpisodes = episodes.filter(ep => ep.origin !== "offline_history");
+        const offlineEpisodes = episodes.filter(ep => ep.origin === "offline_history");
         const effectiveEpisodeDays = Math.max(limits.episodeDays, DEFAULT_MERGE_THRESHOLDS.episodeToWeek + 1);
         const cutoff = Date.now() - effectiveEpisodeDays * 86400_000;
-        const filtered = episodes.filter(ep =>
+        const filteredLive = liveEpisodes.filter(ep =>
             new Date(ep.date).getTime() >= cutoff
         );
-        if (filtered.length < episodes.length) {
-            updateData.recentEpisodes = filtered;
+        if (filteredLive.length < liveEpisodes.length) {
+            updateData.recentEpisodes = [...filteredLive, ...offlineEpisodes];
             changed = true;
         }
     }
@@ -1697,7 +1827,9 @@ export async function mergeEpisodes(
     if (!profile) return 0;
 
     const now = Date.now();
-    const recentEpisodes = profile.recentEpisodes ?? [];
+    const allRecentEpisodes = profile.recentEpisodes ?? [];
+    const offlineEpisodes = allRecentEpisodes.filter(ep => ep.origin === "offline_history");
+    const recentEpisodes = allRecentEpisodes.filter(ep => ep.origin !== "offline_history");
     const existingMerged = profile.mergedMemory ?? [];
     const thresholds = resolveMergeThresholds(reflectionConfig);
 
@@ -1808,16 +1940,23 @@ export async function mergeEpisodes(
         recentEpisodes: kept,
     });
 
-    // ── Step 6: 写回 ──
+    // ── Step 6: 原子写回（保留并发写入的 offline_history 与新到达的 live episodes） ──
     // 按 periodStart 降序排列（最近的在前）
     newMergedList.sort((a, b) =>
         new Date(b.periodStart).getTime() - new Date(a.periodStart).getTime()
     );
 
-    memory.upsertPersonGroupProfile(userId, chatId, {
-        recentEpisodes: kept,
-        mergedMemory: newMergedList,
-    });
+    if (memory.commitMergedEpisodes) {
+        memory.commitMergedEpisodes(userId, chatId, {
+            removedLiveEpisodeIds: toMerge.map(ep => ep.id),
+            mergedMemory: newMergedList,
+        });
+    } else {
+        memory.upsertPersonGroupProfile(userId, chatId, {
+            recentEpisodes: [...kept, ...offlineEpisodes],
+            mergedMemory: newMergedList,
+        });
+    }
     promoteMergedMemoryToGlobalProfile(userId, chatId, newWeekEntries, memory);
 
     if (mergedCount > 0) {
@@ -2076,7 +2215,7 @@ function buildExistingMemoryContext(options: ExistingMemoryContextOptions): stri
     const identity = memory.getPersonIdentity(userId);
     const global = memory.getPersonProfile(userId);
 
-    lines.push(`用户: ${formatUserLabel(memory, userId, identity?.displayName)}`);
+    lines.push(`用户: ${formatUserLabel(memory, userId, identity?.displayName, chatId)}`);
     lines.push(`当前 chat: ${formatChatLabel(memory, chatId)}`);
 
     if (global) {
@@ -2121,7 +2260,12 @@ function buildExistingMemoryContext(options: ExistingMemoryContextOptions): stri
         }
     }
 
-    const facts = memory.listCoreFacts({ subject: userId, limit: 8 }).items;
+    const facts = memory.listCoreFacts({
+        subject: userId,
+        limit: 8,
+        authorizedChatId: chatId,
+        includeAllHistory: false,
+    }).items;
     if (facts.length) {
         lines.push("已有 core facts（带来源，参照去重/判断边界）:");
         for (const fact of facts) {

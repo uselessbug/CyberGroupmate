@@ -2,7 +2,7 @@
  * stores.js — Svelte writable stores for global dashboard state
  */
 
-import { writable, get } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import { api } from './api.js';
 import { sortGroupsByLastMessage } from './chat-order.js';
 
@@ -275,6 +275,18 @@ export const topicDetailId = writable(null);
 export const activeMemoryTab = writable('m-persons');
 /** Pending cross-tab navigation payload; consumed by target tab on mount */
 export const pendingMemoryLink = writable(null);
+
+// ─── History import sub-tab ───
+export const activeHistoryTab = writable('h-tasks');
+export const selectedHistoryChatId = writable(null);
+/** GET /history/overview 的最近一次结果；loaded 为 false 表示还没成功拉到过 */
+export const historyOverview = writable({ loaded: false, error: '', runner: null, chats: [] });
+export const selectedHistoryChat = derived(
+  [historyOverview, selectedHistoryChatId],
+  ([$o, $id]) => $o.chats.find(c => c.chatId === $id) || null,
+);
+/** 任务页「待审」数字跳转到审核页时携带的筛选；审核页挂载时消费 */
+export const pendingHistoryReview = writable(null);
 
 // ─── CodeAct Progress (real-time streaming) ───
 /** Map<chatId, Array<progressEvent>> — 每个 chat 的实时进度事件列表 */
