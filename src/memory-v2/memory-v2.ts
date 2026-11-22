@@ -266,7 +266,7 @@ export class MemoryStoreV2 implements IMemoryStoreV2 {
         embeddingConfig?: EmbeddingConfig;
     }) {
         this.db = new Database(dbPath);
-        this.db.pragma("busy_timeout = 5000");
+        this.db.pragma("busy_timeout = 30000");
         this.db.pragma("journal_mode = WAL");
         this.db.pragma("foreign_keys = ON");
         this.embeddingConfig = options?.embeddingConfig;

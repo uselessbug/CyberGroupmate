@@ -2959,4 +2959,65 @@ describe("History offline clustering & social memory initialization", () => {
             cleanupTestMemory(mem, "hist-synth-recurrence-caps");
         }
     });
+
+    it("19. Lease stays alive across slow synchronous planning and tolerates transient SQLITE_BUSY on heartbeat", async () => {
+        const mem = createTestMemory("hist-lease-sync-busy");
+        const chatId = "onebot:group:52099";
+        try {
+            seedMessages(mem, chatId, [
+                { id: "lb1", userId: "onebot:1", name: "Alice", text: "alpha", ts: "2025-07-01T10:00:00.000Z" },
+                { id: "lb2", userId: "onebot:2", name: "Bob", text: "beta", ts: "2025-07-01T10:01:00.000Z" },
+            ]);
+
+            // Inject a single transient SQLITE_BUSY on heartbeat renewal, followed by normal renewals
+            const origRenew = mem.renewHistoryLease.bind(mem);
+            let renewCalls = 0;
+            let injectedBusy = false;
+            mem.renewHistoryLease = ((cid: string, token: string, ttl?: number) => {
+                renewCalls++;
+                if (!injectedBusy && renewCalls >= 2) {
+                    injectedBusy = true;
+                    const err = new Error("database is locked") as Error & { code?: string };
+                    err.code = "SQLITE_BUSY";
+                    throw err;
+                }
+                return origRenew(cid, token, ttl);
+            }) as typeof mem.renewHistoryLease;
+
+            const res = await runHistoryInitializationWithMemory(mem, {
+                chatId,
+                stage: "all",
+                leaseTtlMs: 300,
+                config: makeTestConfig(),
+                llmCall: async (opts) => {
+                    await new Promise(r => setTimeout(r, 150));
+                    if (opts.stage === "cluster") {
+                        return { content: JSON.stringify({ topics: [{ tempId: "t1", label: "Test", messageIds: ["lb1", "lb2"] }] }) };
+                    }
+                    if (opts.stage === "summary") {
+                        return { content: JSON.stringify({ summaries: [{ tempId: "t_1", label: "Test", summary: "alpha beta summary", keyPoints: ["kp1"], keywords: ["kw1"], sentiment: "neutral" }] }) };
+                    }
+                    if (opts.stage !== "synthesis") {
+                        return { content: JSON.stringify({ summaries: [{ tempId: "t_1", label: "Test", summary: "alpha beta summary", keyPoints: ["kp1"], keywords: ["kw1"], sentiment: "neutral" }] }) };
+                    }
+                    const topic = mem.getHistoricalTopicsForChat(chatId)[0];
+                    return {
+                        content: JSON.stringify({
+                            groupUpdates: { evidence: [{ topicId: topic.id, messageIds: ["lb1", "lb2"] }] },
+                            memberProfiles: [],
+                            memes: [],
+                            groupObservations: [],
+                        }),
+                    };
+                },
+            });
+
+            assert.equal(injectedBusy, true, "Test must exercise the transient SQLITE_BUSY branch");
+            assert.ok(renewCalls >= 4, "Lease must be renewed across planning and heartbeat ticks");
+            assert.equal(res.topicsCommitted, 1);
+            assert.equal(mem.findLatestHistoryJob("initialize", chatId)?.status, "done");
+        } finally {
+            cleanupTestMemory(mem, "hist-lease-sync-busy");
+        }
+    });
 });

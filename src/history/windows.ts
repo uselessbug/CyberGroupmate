@@ -144,7 +144,7 @@ function parseOptionalBoundaryMs(raw: string | undefined, timezone: string, name
 export function loadEligibleHistoryMessages(
     memory: MemoryStoreV2,
     chatId: string,
-    options: { since?: string; until?: string; timezone?: string } = {},
+    options: { since?: string; until?: string; timezone?: string; onProgress?: () => void } = {},
 ): HistoryMessageRow[] {
     const timezone = resolveCanonicalWindowTimezone(options.timezone);
     const sinceMs = parseOptionalBoundaryMs(options.since, timezone, "since");
@@ -158,12 +158,17 @@ export function loadEligibleHistoryMessages(
     const result: HistoryMessageRow[] = [];
     let cursor: { timestampMs: number; messageId: string } | null = null;
     const PAGE_SIZE = 500;
+    let pagesFetched = 0;
 
     while (true) {
         const page = memory.listEligibleHistoryMessagePage(chatId, cursor, PAGE_SIZE, {
             sinceMs,
             untilMs,
         });
+        pagesFetched++;
+        if (options.onProgress && pagesFetched % 20 === 0) {
+            options.onProgress();
+        }
         if (page.length === 0) break;
 
         for (const row of page) {
@@ -478,6 +483,7 @@ export function buildSynthesisMacroBatches(
         timezone?: string;
         maxTopicsPerBatch?: number;
         maxSampleMessagesPerTopic?: number;
+        onProgress?: () => void;
     },
 ): BuildSynthesisMacroBatchesResult {
     const {
@@ -487,6 +493,7 @@ export function buildSynthesisMacroBatches(
         timezone: rawTz,
         maxTopicsPerBatch = DEFAULT_MAX_TOPICS_PER_BATCH,
         maxSampleMessagesPerTopic = DEFAULT_MAX_SAMPLE_MESSAGES_PER_TOPIC,
+        onProgress,
     } = options;
 
     const timezone = resolveCanonicalWindowTimezone(rawTz);
@@ -503,7 +510,12 @@ export function buildSynthesisMacroBatches(
         a.startedAt.localeCompare(b.startedAt) || a.id.localeCompare(b.id),
     );
 
+    let topicIdx = 0;
     for (const topic of sortedTopics) {
+        topicIdx++;
+        if (onProgress && topicIdx % 20 === 0) {
+            onProgress();
+        }
         const msgIds = topic.messageRange?.messageIds ?? [];
         if (msgIds.length === 0) {
             skippedPartialTopics.push({
@@ -570,8 +582,13 @@ export function buildSynthesisMacroBatches(
     const boundedMaxTopics = Math.max(1, Math.floor(maxTopicsPerBatch));
     const batches: SynthesisMacroBatch[] = [];
 
+    let batchIdx = 0;
     for (const group of weekGroups) {
         for (let offset = 0, subIdx = 0; offset < group.entries.length; offset += boundedMaxTopics, subIdx++) {
+            batchIdx++;
+            if (onProgress && batchIdx % 10 === 0) {
+                onProgress();
+            }
             const chunk = group.entries.slice(offset, offset + boundedMaxTopics);
             const topicBlocks = chunk.map(item =>
                 buildSynthesisTopicBlock(item.topic, item.messages, memory, chatId, maxSampleMessagesPerTopic),

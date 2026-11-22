@@ -157,8 +157,17 @@ const MIN_CLUSTER_SPLIT_MESSAGES = 15;
 const SYNTHESIS_SAMPLE_STEPS = [12, 6, 3] as const;
 const MAX_RATE_LIMIT_BACKOFF_RETRIES = 2;
 const MAX_RETRY_AFTER_MS = 30_000;
-const DEFAULT_LEASE_TTL_MS = 60_000;
+const DEFAULT_LEASE_TTL_MS = 180_000;
+const MAX_HEARTBEAT_INTERVAL_MS = 30_000;
 export const ESTIMATED_MESSAGES_PER_TOPIC = 10.5;
+
+function isTransientSqliteBusyError(err: unknown): boolean {
+    if (!err || typeof err !== "object") return false;
+    const code = String((err as { code?: unknown }).code ?? "");
+    if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
+    const msg = String((err as { message?: unknown }).message ?? "").toLowerCase();
+    return msg.includes("database is locked") || msg.includes("database table is locked");
+}
 
 const FALLBACK_CLUSTER_PROMPT = `你是一个离线历史聊天话题聚类助手。将按时间顺序排列的历史群聊消息切分为连贯的话题段落。
 只使用输入中提供的 messageIds，每条消息最多归属一个话题，绝不编造不存在的 ID。
@@ -1336,11 +1345,39 @@ export async function runHistoryInitializationWithMemory(
         return vecs[0];
     });
 
-    const heartbeatIntervalMs = Math.max(50, Math.floor(leaseTtlMs / 3));
+    const heartbeatIntervalMs = Math.max(50, Math.min(MAX_HEARTBEAT_INTERVAL_MS, Math.floor(leaseTtlMs / 3)));
+    const syncRenewThrottleMs = Math.max(50, Math.min(15_000, Math.floor(leaseTtlMs / 6)));
+    let lastLeaseRenewAt = Date.now();
+
+    const renewLeaseSync = (force: boolean = false) => {
+        if (jobSignal.aborted) {
+            throw jobSignal.reason instanceof Error ? jobSignal.reason : createAbortError();
+        }
+        const now = Date.now();
+        if (!force && now - lastLeaseRenewAt < syncRenewThrottleMs) {
+            return;
+        }
+        try {
+            memory.renewHistoryLease(chatId, lease.ownerToken, leaseTtlMs);
+            lastLeaseRenewAt = Date.now();
+        } catch (err) {
+            if (isTransientSqliteBusyError(err)) {
+                log.warn("Transient SQLITE_BUSY during sync history lease renewal; will retry", { chatId });
+                return;
+            }
+            throw err;
+        }
+    };
+
     let heartbeatTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
         try {
             memory.renewHistoryLease(chatId, lease.ownerToken, leaseTtlMs);
+            lastLeaseRenewAt = Date.now();
         } catch (err) {
+            if (isTransientSqliteBusyError(err)) {
+                log.warn("Transient SQLITE_BUSY during history lease heartbeat; retrying next tick", { chatId });
+                return;
+            }
             stopHeartbeat();
             leaseAbortController.abort(err instanceof Error ? err : new Error(String(err)));
         }
@@ -1422,9 +1459,13 @@ export async function runHistoryInitializationWithMemory(
             since: options.since,
             until: options.until,
             timezone,
+            onProgress: () => renewLeaseSync(false),
         });
+        renewLeaseSync(true);
         const allWindows = buildHistoryWindows(eligibleMessages, windowConfig);
+        renewLeaseSync(false);
         const coveredIds = memory.getCoveredMessageIds(chatId);
+        renewLeaseSync(true);
         const uncoveredWindows = allWindows.filter(w => w.messages.some(m => !coveredIds.has(m.messageId)));
 
         let pendingWindows: HistoryWindow[] = [];
@@ -1507,7 +1548,7 @@ export async function runHistoryInitializationWithMemory(
 
                 for (const win of toProcess) {
                     if (jobSignal.aborted) throw jobSignal.reason instanceof Error ? jobSignal.reason : createAbortError();
-                    memory.renewHistoryLease(chatId, lease.ownerToken, leaseTtlMs);
+                    renewLeaseSync(true);
 
                     const clustered = await clusterWindowResilient({
                         chatId,
@@ -1542,13 +1583,16 @@ export async function runHistoryInitializationWithMemory(
 
             // ── Stage 2: Social Memory Synthesis ──
             if (runSynthesizeStage) {
+                renewLeaseSync(true);
                 const historicalTopics = memory.getHistoricalTopicsForChat(chatId);
                 const synthPlan = buildSynthesisMacroBatches(historicalTopics, memory, {
                     chatId,
                     since: options.since,
                     until: options.until,
                     timezone,
+                    onProgress: () => renewLeaseSync(false),
                 });
+                renewLeaseSync(true);
                 skippedPartialTopics = synthPlan.skippedPartialTopics;
 
                 let pendingBatches: SynthesisMacroBatch[];
@@ -1618,7 +1662,7 @@ export async function runHistoryInitializationWithMemory(
 
                 for (const batch of toProcess) {
                     if (jobSignal.aborted) throw jobSignal.reason instanceof Error ? jobSignal.reason : createAbortError();
-                    memory.renewHistoryLease(chatId, lease.ownerToken, leaseTtlMs);
+                    renewLeaseSync(true);
 
                     const synthesized = await synthesizeBatchResilient({
                         chatId,
@@ -1661,6 +1705,7 @@ export async function runHistoryInitializationWithMemory(
 
             // ── Stage 3: Checkpointed Embedding Stage ──
             if (embeddingCfg) {
+                renewLeaseSync(true);
                 const embedRes = await runCheckpointedEmbedStage({
                     jobId: job.jobId,
                     ownerToken: lease.ownerToken,
