@@ -250,3 +250,14 @@ export function getOneBotNapCatWriteTarget(action: string, params: unknown): str
     }
     return undefined;
 }
+
+export function getOneBotNapCatReadTarget(action: string, params: unknown): string | undefined {
+    const normalized = canonicalOneBotWriteAction(action);
+    if (ONEBOT_NAPCAT_WRITE_ACTIONS.has(normalized)) return undefined;
+    const rec = params && typeof params === "object" ? params as Record<string, unknown> : {};
+    if (rec.group_id != null) return compositeChatId("group", rec.group_id);
+    if (rec.user_id != null && (normalized === "get_friend_msg_history" || normalized === "get_private_file_url")) {
+        return compositeChatId("private", rec.user_id);
+    }
+    return undefined;
+}

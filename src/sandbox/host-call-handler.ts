@@ -33,7 +33,12 @@ import type { AttentionAccumulator } from "../accumulator/attention-accumulator.
 import type { PlatformAdapter } from "../adapter/platform-adapter.js";
 import { userGate } from "../adapter/user-gate.js";
 import { getTelegramMtcuteWriteTarget, TELEGRAM_MTCUTE_WRITE_METHODS } from "../core/telegram-mtcute-passthrough.js";
-import { getOneBotNapCatWriteTarget, isOneBotNapCatWriteAction, normalizeOneBotNapCatAction } from "../core/onebot-napcat-passthrough.js";
+import {
+    getOneBotNapCatReadTarget,
+    getOneBotNapCatWriteTarget,
+    isOneBotNapCatWriteAction,
+    normalizeOneBotNapCatAction,
+} from "../core/onebot-napcat-passthrough.js";
 import { timestampInputToIso } from "../core/timezone.js";
 import { resolveTodoDueAt } from "../core/todo-expiry.js";
 import { prefixedShortUuid } from "../core/ids.js";
@@ -245,6 +250,40 @@ function getRestrictedWriteTarget(method: string, args: unknown[], adapter: Plat
         const native = getOneBotNativeParams(method, args);
         if (native && isOneBotNapCatWriteAction(native.action)) {
             return getOneBotNapCatWriteTarget(native.action, native.params);
+        }
+    }
+    return undefined;
+}
+
+const TELEGRAM_CHAT_SCOPED_READ_METHODS = new Set([
+    "telegram.getChat",
+    "telegram.getFullChat",
+    "telegram.getChatMembers",
+    "telegram.getHistory",
+    "telegram.readHistory",
+    "telegram.getForumTopics",
+    "telegram.getMessages",
+    "telegram.searchMessages",
+    "telegram.getPollResults",
+    "telegram.getMessageReactions",
+]);
+
+function getRestrictedReadTarget(method: string, args: unknown[], adapter: PlatformAdapter): unknown {
+    if (adapter.platform === "onebot") {
+        const native = getOneBotNativeParams(method, args);
+        if (native) {
+            return getOneBotNapCatReadTarget(native.action, native.params);
+        }
+        return undefined;
+    }
+    if (adapter.platform === "telegram" && TELEGRAM_CHAT_SCOPED_READ_METHODS.has(method)) {
+        return args[0];
+    }
+    if (adapter.platform === "feishu") {
+        try {
+            return getFeishuReadTarget(method, args);
+        } catch {
+            return undefined;
         }
     }
     return undefined;
@@ -639,25 +678,30 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                     }
                 }
             }
-            // 提取一次写目标，chat_filter 访问控制、R2 隔离与全局严格开关共用。
+            // 提取一次读写目标，chat_filter 访问控制、R2 隔离与全局严格开关共用。
             const isWriteCall = isPlatformWriteMethod(method, args, adapter);
             const writeTarget = isWriteCall ? getRestrictedWriteTarget(method, args, adapter) : undefined;
             const targetCompositeId = writeTarget != null && String(writeTarget).trim() !== "" && !isSelfTarget(writeTarget)
                 ? ensureCompositeId(adapter.platform as PlatformName, String(writeTarget).trim())
                 : null;
+            const readTarget = !isWriteCall ? getRestrictedReadTarget(method, args, adapter) : undefined;
+            const readTargetCompositeId = readTarget != null && String(readTarget).trim() !== "" && !isSelfTarget(readTarget)
+                ? ensureCompositeId(adapter.platform as PlatformName, String(readTarget).trim())
+                : null;
             const externalTarget = targetCompositeId && !isInternalAgentChatId(chatId) && isValidCompositeChatId(chatId)
                 ? targetCompositeId
                 : null;
 
-            // chat_filter 出口兜底：被拦截的会话（无论 boundChatId 还是显式写入目标）均禁止平台写操作。
-            if (isWriteCall) {
-                const chatFilter = loadLatestConfig().chatFilter;
-                if (!isInternalAgentChatId(chatId)) {
-                    assertOutboundChatAllowed(chatFilter, chatId, method);
-                }
-                if (targetCompositeId) {
-                    assertOutboundChatAllowed(chatFilter, targetCompositeId, method);
-                }
+            // chat_filter 出口兜底：被拦截的会话（无论 boundChatId 还是显式读写目标）均禁止平台访问。
+            const chatFilter = loadLatestConfig().chatFilter;
+            if (!isInternalAgentChatId(chatId)) {
+                assertOutboundChatAllowed(chatFilter, chatId, method);
+            }
+            if (targetCompositeId) {
+                assertOutboundChatAllowed(chatFilter, targetCompositeId, method);
+            }
+            if (readTargetCompositeId) {
+                assertOutboundChatAllowed(chatFilter, readTargetCompositeId, method);
             }
 
             // R2 写隔离：私密会话内容不得外发（始终生效，独立于 restrictAdapterWritesToBoundChat 全局开关）。
@@ -780,6 +824,9 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
         }
 
         if (method === "runtime.elevate") {
+            if (!isInternalAgentChatId(chatId)) {
+                assertOutboundChatAllowed(loadLatestConfig().chatFilter, chatId, method);
+            }
             const [request, options] = args as [string, { urgency?: string; data?: unknown } | undefined];
             const description = String(request ?? "").trim();
             if (!description) {

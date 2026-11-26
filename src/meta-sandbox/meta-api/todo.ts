@@ -1,4 +1,6 @@
 import type { MemoryStoreV2 } from "../../memory-v2/index.js";
+import { loadLatestConfig } from "../../core/config.js";
+import { assertOutboundChatAllowed, isInternalAgentChatId, shouldDropInbound } from "../../core/inbound-filter.js";
 import { resolveTodoDueAt } from "../../core/todo-expiry.js";
 
 type TodoMemory = Pick<MemoryStoreV2,
@@ -33,12 +35,18 @@ export interface TodoListInput {
 export function createTodoApi(memory: TodoMemory) {
     return {
         get: async (key: string, bindingId = "meta") => {
-            return memory.todoGet(normalizeBindingId(bindingId), key);
+            const normalized = normalizeBindingId(bindingId);
+            if (!isInternalAgentChatId(normalized) && shouldDropInbound(loadLatestConfig().chatFilter, { chatId: normalized })) {
+                return null;
+            }
+            return memory.todoGet(normalized, key);
         },
         list: async (options: TodoListInput = {}) => {
-            const bindingIds = options.bindingId
+            const chatFilter = loadLatestConfig().chatFilter;
+            const bindingIds = (options.bindingId
                 ? [normalizeBindingId(options.bindingId)]
-                : uniqueStrings(["meta", ...memory.listGroupModels().map((group) => group.chatId)]);
+                : uniqueStrings(["meta", ...memory.listGroupModels().map((group) => group.chatId)])
+            ).filter((id) => isInternalAgentChatId(id) || !shouldDropInbound(chatFilter, { chatId: id }));
             return bindingIds.flatMap((bindingId) =>
                 memory.todoList(bindingId, { includeExpired: options.includeExpired })
                     .map((item) => ({ ...item, bindingId }))
@@ -46,6 +54,9 @@ export function createTodoApi(memory: TodoMemory) {
         },
         set: async (input: TodoSetInput) => {
             const bindingId = requireBindingId(input.bindingId);
+            if (!isInternalAgentChatId(bindingId)) {
+                assertOutboundChatAllowed(loadLatestConfig().chatFilter, bindingId, "todo.set");
+            }
             const key = requireNonEmpty(input.key, "key");
             const content = requireNonEmpty(input.content, "content");
             return {
@@ -55,6 +66,10 @@ export function createTodoApi(memory: TodoMemory) {
         },
         update: async (key: string, input: TodoUpdateInput, bindingId: string) => {
             const currentBindingId = requireBindingId(bindingId);
+            const chatFilter = loadLatestConfig().chatFilter;
+            if (!isInternalAgentChatId(currentBindingId)) {
+                assertOutboundChatAllowed(chatFilter, currentBindingId, "todo.update");
+            }
             const currentKey = requireNonEmpty(key, "key");
             const existing = memory.todoGet(currentBindingId, currentKey);
             if (!existing) return null;
@@ -62,6 +77,9 @@ export function createTodoApi(memory: TodoMemory) {
             const nextBindingId = input.bindingId != null
                 ? requireBindingId(input.bindingId)
                 : currentBindingId;
+            if (!isInternalAgentChatId(nextBindingId)) {
+                assertOutboundChatAllowed(chatFilter, nextBindingId, "todo.update");
+            }
             const nextKey = input.key != null
                 ? requireNonEmpty(input.key, "key")
                 : currentKey;

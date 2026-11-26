@@ -25,7 +25,7 @@ import { AttentionAccumulator } from "../accumulator/attention-accumulator.js";
 import { createLogger } from "../core/logger.js";
 import { loadLatestConfig } from "../core/config.js";
 import { ensureCompositeId, getPlatform } from "../core/chat-id.js";
-import { isInternalAgentChatId, shouldDropInbound } from "../core/inbound-filter.js";
+import { isEmptyWhitelistFilter, isInternalAgentChatId, shouldDropInbound } from "../core/inbound-filter.js";
 import { buildWakeConditionPayload, matchCallbackWakeConditions } from "./wake-conditions.js";
 import type { PlatformAdapter } from "../adapter/platform-adapter.js";
 import { markChatAsRead } from "../adapter/read-receipts.js";
@@ -597,6 +597,9 @@ export class MainAgentLoop {
     }
 
     private shouldTriggerProactiveIdle(now: number): boolean {
+        if (isEmptyWhitelistFilter(loadLatestConfig().chatFilter)) {
+            return false;
+        }
         const hasIdleRunAfterRecentActivity = this.lastProactiveIdleAt > 0
             && this.lastProactiveIdleAt >= this.lastNonIdleActivityAt;
         const baselineAt = hasIdleRunAfterRecentActivity

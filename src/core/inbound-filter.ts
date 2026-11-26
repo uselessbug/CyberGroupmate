@@ -16,6 +16,17 @@ export function isInternalAgentChatId(chatId: string | undefined): boolean {
 }
 
 /**
+ * Returns true when `chat_filter` is enabled in `whitelist` mode with zero
+ * whitelisted chats or users — meaning every external chat/user is blocked.
+ */
+export function isEmptyWhitelistFilter(config: ChatFilterConfig | undefined): boolean {
+    if (!config?.enabled || (config.mode ?? "blacklist") !== "whitelist") return false;
+    const hasChats = (config.chatIds ?? []).some((item) => item.trim() !== "");
+    const hasUsers = (config.userIds ?? []).some((item) => item.trim() !== "");
+    return !hasChats && !hasUsers;
+}
+
+/**
  * Enforce outbound chat_filter: throws an `[Access control]` error when `chatId`
  * is blocked by `chatFilter` (`shouldDropInbound === true`).
  */

@@ -16,6 +16,7 @@ import { registerNotifyTools } from "../src/mcp-server/tools/notify.js";
 import { createConversationsApi } from "../src/meta-sandbox/meta-api/conversations.js";
 import { createDispatchApi } from "../src/meta-sandbox/meta-api/dispatch.js";
 import { createCronApi, createReminderApi } from "../src/meta-sandbox/meta-api/scheduler.js";
+import { createTodoApi } from "../src/meta-sandbox/meta-api/todo.js";
 import { createSandboxHostCallHandler } from "../src/sandbox/host-call-handler.js";
 import { CallbackQueue } from "../src/subagent/callback-queue.js";
 import { SubagentManager } from "../src/subagent/subagent-manager.js";
@@ -554,5 +555,152 @@ describe("outbound chat_filter enforcement", () => {
         await loop.tick();
         assert.deepEqual(attendedChats, ["onebot:group:99999"]);
         assert.deepEqual(sourceEnqueued, []);
+    });
+
+    it("suppresses PROACTIVE_IDLE wakeups when chat_filter is an empty whitelist", async () => {
+        const dir = makeTempDir("outbound-filter-idle");
+        const globalState = new GlobalState({
+            filePath: join(dir, "global-state.json"),
+            autoSaveInterval: 0,
+        });
+        const accumulator = new AttentionAccumulator(globalState, { windowMs: 0, topN: 5 });
+        const callbackQueue = new CallbackQueue();
+        const subagentManager = new SubagentManager({ sessionsDir: join(dir, "sessions") });
+        const loop = new MainAgentLoop(accumulator, callbackQueue, subagentManager, {}, globalState);
+
+        // Force idle duration past 15-minute PROACTIVE_IDLE_INITIAL_DELAY_MS
+        (loop as any).lastNonIdleActivityAt = Date.now() - 20 * 60 * 1000;
+
+        const attendedChats: string[] = [];
+        let proactiveHandlerCalls = 0;
+        loop.setProactiveIdleHandler(() => {
+            proactiveHandlerCalls++;
+            return true;
+        });
+        loop.setMetaSessionHandler(async (entries) => {
+            attendedChats.push(...entries.map((e) => e.chatId));
+            return {
+                endReason: "end_turn",
+                turns: [],
+                messages: [],
+                attendResults: [],
+            } as any;
+        });
+
+        const configPath = applyChatFilterConfig({
+            enabled: true,
+            mode: "whitelist",
+            chatIds: [],
+            userIds: [],
+        });
+
+        await loop.tick();
+        assert.equal(proactiveHandlerCalls, 0);
+        assert.deepEqual(attendedChats, []);
+
+        // Also check fallback path when proactiveIdleHandler is null
+        loop.setProactiveIdleHandler(null);
+        await loop.tick();
+        assert.deepEqual(attendedChats, []);
+
+        // Once at least one chat is whitelisted, PROACTIVE_IDLE is allowed again
+        writeFilterConfigFile(configPath, {
+            enabled: true,
+            mode: "whitelist",
+            chatIds: ["onebot:group:99999"],
+        });
+        await loop.tick();
+        assert.deepEqual(attendedChats, ["__meta__"]);
+    });
+
+    it("enforces chat_filter on conversations.messages/query, todo APIs, and cross-chat platform reads", async () => {
+        const memory = createTestMemory("outbound-filter-read-todo");
+        try {
+            memory.storeMessageBatch([
+                {
+                    messageId: "m-blocked-1",
+                    chatId: "onebot:group:10001",
+                    userId: "onebot:20001",
+                    displayName: "UserOne",
+                    text: "secret keyword alpha",
+                    timestamp: "2026-01-05T10:00:00Z",
+                },
+                {
+                    messageId: "m-allowed-1",
+                    chatId: "onebot:group:99999",
+                    userId: "onebot:20002",
+                    displayName: "UserTwo",
+                    text: "public keyword alpha",
+                    timestamp: "2026-01-05T11:00:00Z",
+                },
+            ]);
+            memory.upsertGroupModel("onebot:group:10001", { chatTitle: "Blocked Group" });
+            memory.upsertGroupModel("onebot:group:99999", { chatTitle: "Allowed Group" });
+            memory.todoUpsert("onebot:group:10001", "stale_probe", "blocked probe", null);
+            memory.todoUpsert("onebot:group:99999", "allowed_todo", "allowed item", null);
+            memory.todoUpsert("meta", "meta_todo", "global item", null);
+
+            applyChatFilterConfig({
+                enabled: true,
+                mode: "whitelist",
+                chatIds: ["onebot:group:99999", "telegram:-100999"],
+            });
+
+            const convApi = createConversationsApi(memory);
+            await assert.rejects(
+                () => convApi.messages("onebot:group:10001"),
+                /\[Access control\].*conversations\.messages.*onebot:group:10001/,
+            );
+            const allowedMsgs = await convApi.messages("onebot:group:99999");
+            assert.equal(allowedMsgs.messages.length, 1);
+
+            const globalQuery = await convApi.query({ keyword: "alpha" });
+            assert.deepEqual(globalQuery.messages.map((m) => m.chatId), ["onebot:group:99999"]);
+
+            const blockedQuery = await convApi.query({ chatIds: ["onebot:group:10001"], keyword: "alpha" });
+            assert.deepEqual(blockedQuery.messages, []);
+
+            const todoApi = createTodoApi(memory);
+            const listedTodos = await todoApi.list({ includeExpired: true });
+            assert.deepEqual(
+                listedTodos.map((t) => t.bindingId).sort(),
+                ["meta", "onebot:group:99999"],
+            );
+            assert.equal(await todoApi.get("stale_probe", "onebot:group:10001"), null);
+            await assert.rejects(
+                () => todoApi.set({ key: "k1", content: "c1", bindingId: "onebot:group:10001" }),
+                /\[Access control\].*todo\.set/,
+            );
+
+            // Cross-chat platform read calls & blocked subagent runtime.elevate
+            const allowedSub = makeSandboxHandler("onebot:group:99999");
+            await assert.rejects(
+                () => allowedSub.handler("onebot.callApi", ["get_group_msg_history", { group_id: 10001, count: 20 }]),
+                /\[Access control\].*onebot:group:10001/,
+            );
+            await assert.rejects(
+                () => allowedSub.handler("onebot.callApi", ["get_friend_msg_history", { user_id: 20002, count: 20 }]),
+                /\[Access control\].*onebot:private:20002/,
+            );
+            await assert.rejects(
+                () => allowedSub.handler("telegram.getHistory", ["telegram:-1001001", { limit: 10 }]),
+                /\[Access control\].*telegram:-1001001/,
+            );
+            await allowedSub.handler("onebot.callApi", ["get_group_msg_history", { group_id: 99999, count: 20 }]);
+            await allowedSub.handler("onebot.callApi", ["get_login_info", {}]);
+            assert.equal(allowedSub.adapterCalls.length, 2);
+
+            const blockedSub = makeSandboxHandler("onebot:group:10001");
+            await assert.rejects(
+                () => blockedSub.handler("onebot.callApi", ["get_login_info", {}]),
+                /\[Access control\].*onebot:group:10001/,
+            );
+            await assert.rejects(
+                () => blockedSub.handler("runtime.elevate", ["need meta help"]),
+                /\[Access control\].*onebot:group:10001/,
+            );
+        } finally {
+            cleanupTestMemory(memory, "outbound-filter-read-todo");
+        }
     });
 });

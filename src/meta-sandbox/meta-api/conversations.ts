@@ -1,6 +1,6 @@
 import { getGroupModelKey, getPlatform } from "../../core/chat-id.js";
 import { loadLatestConfig } from "../../core/config.js";
-import { shouldDropInbound } from "../../core/inbound-filter.js";
+import { assertOutboundChatAllowed, shouldDropInbound } from "../../core/inbound-filter.js";
 import { formatMessageBody } from "../../core/message-enricher.js";
 import { requireNonEmptyString } from "./params.js";
 import type {
@@ -194,6 +194,7 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
                 "chatId",
                 "形如 telegram:-1001234567890 / telegram:92604174，可先用 conversations.inbox() 查",
             );
+            assertOutboundChatAllowed(loadLatestConfig().chatFilter, chatId, "conversations.messages");
             const limit = clampLimit(options.limit, 50, 99);
             const before = timestampInputToIso(decodeMessageCursor(options.cursor) ?? options.before) ?? undefined;
             const after = timestampInputToIso(options.after) ?? undefined;
@@ -215,29 +216,37 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
             };
         },
         query: async (filters: ConversationsQueryFilters = {}): Promise<ConversationsQueryResult> => {
+            const chatFilter = loadLatestConfig().chatFilter;
             const normalizedFilters = normalizeFilters(filters);
             const limit = clampLimit(filters.limit, 20, 100);
-            const chatIds = uniqueStrings(filters.chatIds);
-            const keyword = filters.keyword?.trim();
+            const requestedChatIds = uniqueStrings(filters.chatIds);
+            const chatIds = requestedChatIds.filter((id) => !shouldDropInbound(chatFilter, { chatId: id }));
             const resolvedUsers = resolveUsers(memory, normalizedFilters, limit);
+            if (requestedChatIds.length > 0 && chatIds.length === 0) {
+                return { messages: [], topics: [], resolvedUsers };
+            }
+            const keyword = filters.keyword?.trim();
             const userIds = resolvedUsers.map((user) => user.userId);
             const fallbackName = filters.user && userIds.length === 0 ? filters.user.trim() : undefined;
 
-            const messages = enrichMessages(memory, queryMessages(memory, {
+            const rawMessages = queryMessages(memory, {
                 filters: normalizedFilters,
                 limit,
                 chatIds,
                 keyword,
                 userIds,
                 fallbackName,
-            }));
-            const topics = enrichTopics(memory, queryTopics(memory, {
+            }).filter((row) => !shouldDropInbound(chatFilter, { chatId: row.chatId }));
+            const rawTopics = queryTopics(memory, {
                 filters: normalizedFilters,
                 limit,
                 chatIds,
                 keyword,
                 userIds,
-            }));
+            }).filter((row) => !shouldDropInbound(chatFilter, { chatId: row.chatId }));
+
+            const messages = enrichMessages(memory, rawMessages);
+            const topics = enrichTopics(memory, rawTopics);
 
             return { messages, topics, resolvedUsers };
         },
