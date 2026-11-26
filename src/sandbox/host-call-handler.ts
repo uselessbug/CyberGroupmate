@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import { ensureCompositeId, getGroupModelKey, getPlatform, isValidCompositeChatId } from "../core/chat-id.js";
+import { ensureCompositeId, getGroupModelKey, getPlatform, isValidCompositeChatId, type PlatformName } from "../core/chat-id.js";
 import {
     assertEgressAllowed,
     isExplicitReadBlocked,
@@ -12,6 +12,7 @@ import {
 } from "../core/visibility-policy.js";
 import {
     loadConfig,
+    loadLatestConfig,
     resolveComponentProfiles,
     saveConfig,
     validateConfig,
@@ -19,6 +20,7 @@ import {
     type AppConfig,
     type EnvironmentVariable,
 } from "../core/config.js";
+import { assertOutboundChatAllowed, isInternalAgentChatId, shouldDropInbound } from "../core/inbound-filter.js";
 import { validateCronMinInterval } from "../core/cron-matcher.js";
 import { createLogger } from "../core/logger.js";
 import { describeImage, ensureSupportedFormat } from "../core/vision-processor.js";
@@ -108,7 +110,7 @@ function isValidEnvKey(key: string): boolean {
 }
 
 function isBoundChatWriteRestrictionEnabled(): boolean {
-    return loadConfig("config.yaml", true).subagent?.restrictAdapterWritesToBoundChat === true;
+    return loadLatestConfig().subagent?.restrictAdapterWritesToBoundChat === true;
 }
 
 /**
@@ -205,9 +207,29 @@ function getFeishuReadTarget(method: string, args: unknown[]): string | undefine
     return target;
 }
 
+function isPlatformWriteMethod(method: string, args: unknown[], adapter: PlatformAdapter): boolean {
+    if (adapter.getWriteMethods().includes(method)) return true;
+    if (method === "feishu.callApi" && FEISHU_WRITE_ACTIONS.has(String(args[1] ?? ""))) return true;
+    if (adapter.platform === "telegram") {
+        if (method === "telegram.joinChat" || method === "telegram.leaveChat") return true;
+        if (method === "telegram.mtcute") {
+            return TELEGRAM_MTCUTE_WRITE_METHODS.has(String(args[0] ?? ""));
+        }
+        if (method.startsWith("telegram.")) {
+            return TELEGRAM_MTCUTE_WRITE_METHODS.has(method.slice("telegram.".length));
+        }
+    }
+    if (adapter.platform === "onebot") {
+        const native = getOneBotNativeParams(method, args);
+        return !!(native && isOneBotNapCatWriteAction(native.action));
+    }
+    return false;
+}
+
 function getRestrictedWriteTarget(method: string, args: unknown[], adapter: PlatformAdapter): unknown {
     if (adapter.getWriteMethods().includes(method)) return args[0];
     if (method === "feishu.callApi" && FEISHU_WRITE_ACTIONS.has(String(args[1] ?? ""))) return args[0];
+    if (method === "telegram.joinChat" || method === "telegram.leaveChat") return args[0];
     if (adapter.platform === "telegram" && method.startsWith("telegram.")) {
         const mtcuteMethod = method.slice("telegram.".length);
         if (TELEGRAM_MTCUTE_WRITE_METHODS.has(mtcuteMethod)) {
@@ -617,12 +639,26 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
                     }
                 }
             }
-            // 提取一次写目标，R2 隔离与全局严格开关共用。
-            const writeTarget = getRestrictedWriteTarget(method, args, adapter);
-            const externalTarget = writeTarget != null && !isSelfTarget(writeTarget)
-                && chatId !== "__background__" && isValidCompositeChatId(chatId)
-                ? ensureCompositeId(getPlatform(chatId), String(writeTarget))
+            // 提取一次写目标，chat_filter 访问控制、R2 隔离与全局严格开关共用。
+            const isWriteCall = isPlatformWriteMethod(method, args, adapter);
+            const writeTarget = isWriteCall ? getRestrictedWriteTarget(method, args, adapter) : undefined;
+            const targetCompositeId = writeTarget != null && String(writeTarget).trim() !== "" && !isSelfTarget(writeTarget)
+                ? ensureCompositeId(adapter.platform as PlatformName, String(writeTarget).trim())
                 : null;
+            const externalTarget = targetCompositeId && !isInternalAgentChatId(chatId) && isValidCompositeChatId(chatId)
+                ? targetCompositeId
+                : null;
+
+            // chat_filter 出口兜底：被拦截的会话（无论 boundChatId 还是显式写入目标）均禁止平台写操作。
+            if (isWriteCall) {
+                const chatFilter = loadLatestConfig().chatFilter;
+                if (!isInternalAgentChatId(chatId)) {
+                    assertOutboundChatAllowed(chatFilter, chatId, method);
+                }
+                if (targetCompositeId) {
+                    assertOutboundChatAllowed(chatFilter, targetCompositeId, method);
+                }
+            }
 
             // R2 写隔离：私密会话内容不得外发（始终生效，独立于 restrictAdapterWritesToBoundChat 全局开关）。
             if (externalTarget) {
@@ -670,6 +706,9 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
         }
 
         if (method === "cron.add") {
+            if (!isInternalAgentChatId(chatId)) {
+                assertOutboundChatAllowed(loadLatestConfig().chatFilter, chatId, method);
+            }
             const [name, cronExpr, taskDescription] = args as [string, string, string];
             if (!validateCronMinInterval(cronExpr, 60)) {
                 throw new Error("cron 最短触发间隔为 1 小时");
@@ -709,6 +748,9 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
         }
 
         if (method === "runtime.remind") {
+            if (!isInternalAgentChatId(chatId)) {
+                assertOutboundChatAllowed(loadLatestConfig().chatFilter, chatId, method);
+            }
             const [description, delayMinutes] = args as [string, number];
             if (typeof delayMinutes !== "number" || delayMinutes < 1) {
                 throw new Error("remind 最短 1 分钟");
@@ -1162,6 +1204,11 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
             if (targetChatId === chatId) {
                 throw new Error("当前 Subagent 不能 dispatch 给自己；当前群内行动请直接调用平台 API。");
             }
+            const dispatchChatFilter = loadLatestConfig().chatFilter;
+            if (!isInternalAgentChatId(chatId)) {
+                assertOutboundChatAllowed(dispatchChatFilter, chatId, method);
+            }
+            assertOutboundChatAllowed(dispatchChatFilter, targetChatId, method);
             // R2 dispatch 隔离：私密会话不得把任务派出去，也不得把任务派进别人的私密会话。
             assertEgressAllowed("egress-dispatch", method, targetChatId, policy());
             return dispatchApi.taskToGroup(targetChatId, args[1], {
@@ -1222,7 +1269,7 @@ export function createSandboxHostCallHandler(chatId: string, deps: CreateSandbox
 
             const { newlyBlocked } = userGate.block(target);
             let notified = false;
-            if (newlyBlocked) {
+            if (newlyBlocked && !shouldDropInbound(loadLatestConfig().chatFilter, { chatId })) {
                 // 通过当前平台 adapter 的 sendText 发一次预设文案（send 失败不影响拉黑）。
                 const adapter = adapters.find(a => a.platform === platform);
                 const message = loadConfig().emergencyBlock?.message ?? DEFAULT_EMERGENCY_BLOCK_MESSAGE;

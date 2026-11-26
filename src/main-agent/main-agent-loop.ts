@@ -23,7 +23,9 @@ import { DEFAULT_SUBAGENT_CONFIG } from "../subagent/types.js";
 import type { AttentionItem } from "../accumulator/types.js";
 import { AttentionAccumulator } from "../accumulator/attention-accumulator.js";
 import { createLogger } from "../core/logger.js";
+import { loadLatestConfig } from "../core/config.js";
 import { ensureCompositeId, getPlatform } from "../core/chat-id.js";
+import { isInternalAgentChatId, shouldDropInbound } from "../core/inbound-filter.js";
 import { buildWakeConditionPayload, matchCallbackWakeConditions } from "./wake-conditions.js";
 import type { PlatformAdapter } from "../adapter/platform-adapter.js";
 import { markChatAsRead } from "../adapter/read-receipts.js";
@@ -318,9 +320,19 @@ export class MainAgentLoop {
             const attendedThisTick = new Set<string>();
             const entryByChatId = new Map<string, AttentionQueueEntry>();
 
+            const currentChatFilter = loadLatestConfig().chatFilter;
             for (const item of releasedItems) {
                 if (item.source !== "PROACTIVE_IDLE") {
                     this.lastNonIdleActivityAt = Date.now();
+                }
+
+                if (!isInternalAgentChatId(item.chatId) && shouldDropInbound(currentChatFilter, { chatId: item.chatId })) {
+                    log.info("attention item skipped: blocked by chat_filter", {
+                        chatId: item.chatId,
+                        source: item.source,
+                        layer: item.layer,
+                    });
+                    continue;
                 }
 
                 // 如果该 chatId 的 executor 正在处理或队列中有任务，
@@ -460,6 +472,15 @@ export class MainAgentLoop {
             return;
         }
         if (dispatchedTask.sourceChatId === dispatchedTask.chatId) {
+            return;
+        }
+        if (!isInternalAgentChatId(dispatchedTask.sourceChatId)
+            && shouldDropInbound(loadLatestConfig().chatFilter, { chatId: dispatchedTask.sourceChatId })) {
+            log.info("dispatch source notification skipped: sourceChatId blocked by chat_filter", {
+                sourceChatId: dispatchedTask.sourceChatId,
+                targetChatId: dispatchedTask.chatId,
+                taskId: dispatchedTask.taskId,
+            });
             return;
         }
 

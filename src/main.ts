@@ -13,7 +13,7 @@
 import { NotificationCenter, type NotificationEvent } from "./event/notification-center.js";
 import { ensureCompositeId, getRawId, getPlatform, getGroupModelKey } from "./core/chat-id.js";
 import { userGate } from "./adapter/user-gate.js";
-import { shouldDropInbound } from "./core/inbound-filter.js";
+import { isInternalAgentChatId, shouldDropInbound } from "./core/inbound-filter.js";
 import { SandboxPool } from "./sandbox/sandbox-pool.js";
 import type { ShellWakeEvent } from "./sandbox/sandbox.js";
 import { installSkillsDependencies } from "./sandbox/skill-loader.js";
@@ -22,6 +22,7 @@ import { MemoryStoreV2, computeStatsHour } from "./memory-v2/index.js";
 import { createMemoryStore } from "./core/memory-factory.js";
 import {
     loadConfig,
+    loadLatestConfig,
     resolveComponentProfiles,
     resolveComponentTimeout,
     resolveEmbeddingConfig,
@@ -520,7 +521,11 @@ async function main(): Promise<void> {
             embeddingConfig,
             pipelineConfig: appConfig.recordingPipeline,
             publishTopicSignals: (signals) => {
-                const deliverableSignals = signals.filter((signal) => !postTaskWindows?.hasActiveWindow(signal.chatId));
+                const chatFilter = loadLatestConfig().chatFilter;
+                const deliverableSignals = signals.filter(
+                    (signal) => !postTaskWindows?.hasActiveWindow(signal.chatId)
+                        && !shouldDropInbound(chatFilter, { chatId: signal.chatId }),
+                );
                 const suppressedCount = signals.length - deliverableSignals.length;
                 for (const signal of deliverableSignals) {
                     accumulator.ingest(2, {
@@ -640,6 +645,10 @@ async function main(): Promise<void> {
         getWatermark: (chatId, ordering) => memory.getBackfillWatermark(chatId, ordering),
         listKnownChatIds: (platform) => memory.listBackfillChatIds(platform),
         onConsolidatedWake: (chatId, summary) => {
+            if (shouldDropInbound(loadLatestConfig().chatFilter, { chatId })) {
+                log.info("补抓合并唤醒被 chat_filter 拦截", { chatId });
+                return;
+            }
             const sub = subagentManager.getOrCreate(chatId);
             const entry = sub.buildQueueEntry("DIRECT_ADDRESS");
             // reason 会作为 directAddressReason 进入 meta prompt —— 必须让 agent 明白
@@ -1031,7 +1040,12 @@ async function main(): Promise<void> {
     const reflectionInterval = setInterval(async () => {
         if (shuttingDown) return;
         const now = Date.now();
+        const currentChatFilter = loadLatestConfig().chatFilter;
         for (const [chatId, lastActive] of lastActivityPerChat) {
+            if (shouldDropInbound(currentChatFilter, { chatId })) {
+                lastActivityPerChat.delete(chatId);
+                continue;
+            }
             if (reflectionInProgress.has(chatId)) continue;
 
             const silentSec = (now - lastActive) / 1000;
@@ -1193,6 +1207,14 @@ async function main(): Promise<void> {
 
     function enqueueShellWakeDirectTask(chatId: string, event: ShellWakeEvent): void {
         try {
+            if (!isInternalAgentChatId(chatId) && shouldDropInbound(loadLatestConfig().chatFilter, { chatId })) {
+                log.info("shell_wake 被 chat_filter 拦截，已跳过", {
+                    chatId,
+                    tabId: event.tabId,
+                    reason: event.reason,
+                });
+                return;
+            }
             const subagent = subagentManager.getOrCreate(chatId);
             const executor = ensureCodeActExecutor(chatId);
             const task = buildShellWakeDirectTask({
@@ -1507,9 +1529,21 @@ async function main(): Promise<void> {
         const now = new Date();
 
         // ── Reminder 检查 ──
+        const currentChatFilter = loadLatestConfig().chatFilter;
         const dueReminders = globalState.getDueReminders();
         for (const reminder of dueReminders) {
             globalState.markReminderTriggered(reminder.id);
+
+            const reminderTargetChatId = !isInternalAgentChatId(reminder.bindingId)
+                ? reminder.bindingId!.trim()
+                : (!isInternalAgentChatId(reminder.chatId) ? reminder.chatId.trim() : null);
+            if (reminderTargetChatId && shouldDropInbound(currentChatFilter, { chatId: reminderTargetChatId })) {
+                log.info("Reminder 到期被 chat_filter 拦截，已跳过", {
+                    id: reminder.id,
+                    targetChatId: reminderTargetChatId,
+                });
+                continue;
+            }
 
             const wakeMatch = matchDelayWakeReminder(reminder, globalState.getWakeConditions());
             if (wakeMatch) {
@@ -1598,6 +1632,17 @@ async function main(): Promise<void> {
             if (!matchesCron(evt.cronExpr, now)) continue;
 
             globalState.markCronTriggered(evt.id);
+            const cronTargetChatId = !isInternalAgentChatId(evt.bindingId)
+                ? evt.bindingId!.trim()
+                : (!isInternalAgentChatId(evt.chatId) ? evt.chatId.trim() : null);
+            if (cronTargetChatId && shouldDropInbound(currentChatFilter, { chatId: cronTargetChatId })) {
+                log.info("Cron 触发被 chat_filter 拦截，已跳过", {
+                    id: evt.id,
+                    name: evt.name ?? evt.description,
+                    targetChatId: cronTargetChatId,
+                });
+                continue;
+            }
             const taskDesc = evt.callback ?? evt.taskTemplate ?? evt.description;
             const cronBindingId = evt.bindingId ?? (evt.chatId === "__meta__" ? "meta" : evt.chatId);
 

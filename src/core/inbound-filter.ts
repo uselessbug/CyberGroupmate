@@ -7,6 +7,34 @@ export interface InboundFilterTarget {
 }
 
 /**
+ * Identify internal non-platform agent/control scopes that should not be
+ * evaluated against external platform chat_filter rules.
+ */
+export function isInternalAgentChatId(chatId: string | undefined): boolean {
+    const trimmed = chatId?.trim();
+    return !trimmed || trimmed === "__meta__" || trimmed === "__background__" || trimmed === "meta";
+}
+
+/**
+ * Enforce outbound chat_filter: throws an `[Access control]` error when `chatId`
+ * is blocked by `chatFilter` (`shouldDropInbound === true`).
+ */
+export function assertOutboundChatAllowed(
+    config: ChatFilterConfig | undefined,
+    chatId: string,
+    actionLabel?: string,
+): void {
+    const normalized = chatId.trim();
+    if (!normalized) return;
+    if (shouldDropInbound(config, { chatId: normalized })) {
+        const prefix = actionLabel ? `[Access control] ${actionLabel}: ` : "[Access control] ";
+        throw new Error(
+            `${prefix}Chat "${normalized}" is blocked by chat_filter; release it in Access Control before targeting it.`,
+        );
+    }
+}
+
+/**
  * Evaluate the global inbound filter. Chat and sender entries share the same
  * mode; matching either list counts as a match.
  */
@@ -84,11 +112,12 @@ export function matchesFilterList(
 }
 
 function chatIdCandidates(chatId: string): string[] {
-    const candidates = idCandidates(chatId);
-    if (!chatId) return candidates;
+    const trimmed = chatId.trim();
+    const candidates = idCandidates(trimmed);
+    if (!trimmed) return candidates;
 
     try {
-        const parsed = parseChatId(chatId);
+        const parsed = parseChatId(trimmed);
         addCandidate(candidates, parsed.groupId);
         addCandidate(candidates, parsed.channelId);
 

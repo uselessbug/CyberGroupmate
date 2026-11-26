@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { loadLatestConfig } from "../../core/config.js";
+import { assertOutboundChatAllowed } from "../../core/inbound-filter.js";
 import type { McpServerDeps } from "../types.js";
 
 export function registerNotifyTools(mcp: McpServer, deps: McpServerDeps): void {
@@ -35,6 +37,7 @@ export function registerNotifyTools(mcp: McpServer, deps: McpServerDeps): void {
                 return { content: [{ type: "text" as const, text: JSON.stringify({ delivered: true, to: "meta", method: "attention_item" }) }] };
             }
 
+            assertOutboundChatAllowed(loadLatestConfig().chatFilter, to, "notify");
             const result = await deps.metaApi.dispatch.taskToGroup(to, {
                 contentDirection: content,
                 useSkills,
@@ -106,6 +109,7 @@ export function registerNotifyTools(mcp: McpServer, deps: McpServerDeps): void {
                 return { content: [{ type: "text" as const, text: JSON.stringify({ delivered: true, target: "meta", method: "attention_item" }) }] };
             }
 
+            assertOutboundChatAllowed(loadLatestConfig().chatFilter, target, "attention_enqueue");
             const result = await deps.metaApi.dispatch.taskToGroup(target, {
                 contentDirection: [
                     input.summary,

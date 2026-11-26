@@ -659,6 +659,7 @@ const DEFAULT_PRIVACY: PrivacyConfig = {
 // ─── 配置加载 ───
 
 let _cached: AppConfig | null = null;
+let _cachedPath: string | null = null;
 
 export function loadConfig(configPath?: string, forceReload?: boolean): AppConfig {
     if (_cached && !forceReload) return _cached;
@@ -817,7 +818,20 @@ export function loadConfig(configPath?: string, forceReload?: boolean): AppConfi
     };
 
     _cached = config;
+    _cachedPath = path;
     return config;
+}
+
+/**
+ * 读取最新配置（生产环境若 config.yaml 存在则强制从磁盘重载，测试中若通过
+ * loadConfig(tempPath, true) 指定了自定义路径且文件存在则重载该路径，否则
+ * 回退到当前缓存，避免无 config.yaml 时覆盖测试注入的配置）。
+ */
+export function loadLatestConfig(): AppConfig {
+    if (_cachedPath && _cachedPath !== "config.yaml") {
+        return existsSync(_cachedPath) ? loadConfig(_cachedPath, true) : loadConfig();
+    }
+    return existsSync("config.yaml") ? loadConfig("config.yaml", true) : loadConfig();
 }
 
 /** 根据 profile 名称获取 LLMConfig */
@@ -876,6 +890,7 @@ export function resolveEmbeddingConfig(config?: AppConfig): EmbeddingConfig | un
 
 export function clearConfigCache(): void {
     _cached = null;
+    _cachedPath = null;
     // Pool 实例与配置绑定，配置变更时需同步清理以保证新 pool 生效
     clearAllPools();
 }

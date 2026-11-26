@@ -207,8 +207,13 @@ export function getOneBotNapCatGuideGroupForAction(action: string): OneBotNapCat
     return undefined;
 }
 
+function canonicalOneBotWriteAction(action: string): string {
+    const normalized = normalizeOneBotNapCatAction(action);
+    return normalized.endsWith("_async") ? normalized.slice(0, -"_async".length) : normalized;
+}
+
 export function isOneBotNapCatWriteAction(action: string): boolean {
-    return ONEBOT_NAPCAT_WRITE_ACTIONS.has(normalizeOneBotNapCatAction(action));
+    return ONEBOT_NAPCAT_WRITE_ACTIONS.has(canonicalOneBotWriteAction(action));
 }
 
 function compositeChatId(kind: "group" | "private", value: unknown): string | undefined {
@@ -217,8 +222,8 @@ function compositeChatId(kind: "group" | "private", value: unknown): string | un
 }
 
 export function getOneBotNapCatWriteTarget(action: string, params: unknown): string | undefined {
-    const normalized = normalizeOneBotNapCatAction(action);
-    if (!isOneBotNapCatWriteAction(normalized)) return undefined;
+    const normalized = canonicalOneBotWriteAction(action);
+    if (!ONEBOT_NAPCAT_WRITE_ACTIONS.has(normalized)) return undefined;
     const rec = params && typeof params === "object" ? params as Record<string, unknown> : {};
 
     if (normalized === "send_msg") {
@@ -232,7 +237,9 @@ export function getOneBotNapCatWriteTarget(action: string, params: unknown): str
     if (rec.group_id != null) return compositeChatId("group", rec.group_id);
     if (rec.user_id != null) {
         if (
-            normalized.includes("private")
+            normalized === "send_msg"
+            || normalized === "send_forward_msg"
+            || normalized.includes("private")
             || normalized.includes("friend")
             || normalized === "send_like"
             || normalized === "set_friend_add_request"

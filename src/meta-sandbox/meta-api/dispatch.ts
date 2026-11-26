@@ -1,5 +1,6 @@
 import type { GroundingConfig } from "../../core/config.js";
-import { loadConfig } from "../../core/config.js";
+import { loadConfig, loadLatestConfig } from "../../core/config.js";
+import { assertOutboundChatAllowed } from "../../core/inbound-filter.js";
 import { shortUuid } from "../../core/ids.js";
 import { runParallelGrounding } from "../../main-agent/grounding-util.js";
 import type { AttentionAccumulator } from "../../accumulator/attention-accumulator.js";
@@ -113,6 +114,7 @@ export function createDispatchApi(deps: DispatchApiDeps) {
                 "chatId",
                 "派发目标会话 ID，形如 telegram:-1001234567890",
             );
+            assertOutboundChatAllowed(loadLatestConfig().chatFilter, chatId, "dispatch.taskToGroup");
             assertNoLegacyContext(taskSpec);
             const source = normalizeDispatchSource(options?.source);
             const subagent = deps.subagentManager.getOrCreate(chatId) as SubagentLike;

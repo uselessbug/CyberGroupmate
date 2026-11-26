@@ -1,4 +1,6 @@
 import { getGroupModelKey, getPlatform } from "../../core/chat-id.js";
+import { loadLatestConfig } from "../../core/config.js";
+import { shouldDropInbound } from "../../core/inbound-filter.js";
 import { formatMessageBody } from "../../core/message-enricher.js";
 import { requireNonEmptyString } from "./params.js";
 import type {
@@ -168,7 +170,9 @@ export function createConversationsApi(memory: ConversationsReader, subagentMana
 
             const subagents = getSubagents(subagentManager);
             const subagentByChatId = new Map(subagents.map((subagent) => [subagent.chatId, subagent]));
-            const chatIds = collectInboxChatIds(memory, subagents, allowed);
+            const chatFilter = loadLatestConfig().chatFilter;
+            const chatIds = collectInboxChatIds(memory, subagents, allowed)
+                .filter((chatId) => !shouldDropInbound(chatFilter, { chatId }));
 
             const allItems = chatIds
                 .map((chatId) => buildInboxItem(memory, chatId, subagentByChatId.get(chatId)))

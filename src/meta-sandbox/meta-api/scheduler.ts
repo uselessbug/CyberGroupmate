@@ -1,4 +1,6 @@
+import { loadLatestConfig } from "../../core/config.js";
 import { validateCronMinInterval } from "../../core/cron-matcher.js";
+import { assertOutboundChatAllowed, isInternalAgentChatId } from "../../core/inbound-filter.js";
 import { timestampInputToIso } from "../../core/timezone.js";
 import type { GlobalState } from "../../main-agent/global-state.js";
 import type { SchedulerEvent } from "../../subagent/types.js";
@@ -57,6 +59,9 @@ export function createReminderApi(globalState: SchedulerState) {
             listEvents(globalState, "reminder", options),
         set: async (input: ReminderSetInput) => {
             const bindingId = normalizeBindingId(input.bindingId);
+            if (!isInternalAgentChatId(bindingId)) {
+                assertOutboundChatAllowed(loadLatestConfig().chatFilter, bindingId, "remind.set");
+            }
             const callback = requireCallback(input.callback);
             const name = normalizeName(input.name, callback);
             const triggerAt = resolveTriggerAt(input);
@@ -79,7 +84,12 @@ export function createReminderApi(globalState: SchedulerState) {
             if (!existing) return null;
 
             const patch: Partial<Omit<SchedulerEvent, "id" | "type" | "createdAt">> = {};
-            if (input.bindingId != null) patch.bindingId = normalizeBindingId(input.bindingId);
+            if (input.bindingId != null) {
+                patch.bindingId = normalizeBindingId(input.bindingId);
+                if (!isInternalAgentChatId(patch.bindingId)) {
+                    assertOutboundChatAllowed(loadLatestConfig().chatFilter, patch.bindingId, "remind.update");
+                }
+            }
             if (input.name != null) patch.name = normalizeName(input.name, existing.name ?? existing.description);
             if (input.callback != null) {
                 const callback = requireCallback(input.callback);
@@ -113,6 +123,9 @@ export function createCronApi(globalState: SchedulerState) {
             listEvents(globalState, "cron", options),
         set: async (input: CronSetInput) => {
             const bindingId = normalizeBindingId(input.bindingId);
+            if (!isInternalAgentChatId(bindingId)) {
+                assertOutboundChatAllowed(loadLatestConfig().chatFilter, bindingId, "cron.set");
+            }
             const callback = requireCallback(input.callback);
             const name = normalizeName(input.name, callback);
             if (!validateCronMinInterval(input.cronExpr, 60)) {
@@ -149,6 +162,9 @@ export function createCronApi(globalState: SchedulerState) {
             const nextBindingId = input.bindingId != null
                 ? normalizeBindingId(input.bindingId)
                 : normalizeBindingId(existing.bindingId ?? (existing.chatId === "__meta__" ? "meta" : existing.chatId));
+            if (input.bindingId != null && !isInternalAgentChatId(nextBindingId)) {
+                assertOutboundChatAllowed(loadLatestConfig().chatFilter, nextBindingId, "cron.update");
+            }
             const nextCronExpr = input.cronExpr != null ? input.cronExpr.trim() : existing.cronExpr;
             const nextCallback = input.callback != null
                 ? requireCallback(input.callback)
